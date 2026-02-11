@@ -291,6 +291,11 @@ pub fn run() {
             #[cfg(desktop)]
             let _ = app.handle().plugin(tauri_plugin_positioner::init());
 
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_icon(tauri::include_image!("./icons/128x128.png"));
+            }
+
             // Setup system tray
             setup_tray(app)?;
 

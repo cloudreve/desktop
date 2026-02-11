@@ -23,6 +23,13 @@ use windows::ApplicationModel::{StartupTask, StartupTaskState};
 /// Result type for Tauri commands
 type CommandResult<T> = Result<T, String>;
 
+#[cfg(target_os = "linux")]
+fn apply_linux_window_icon(window: &WebviewWindow) {
+    if let Err(e) = window.set_icon(tauri::include_image!("./icons/128x128.png")) {
+        tracing::warn!(target: "main", error = %e, "Failed to set Linux window icon");
+    }
+}
+
 /// Check if a path is a root drive (e.g., "C:\", "D:\", "E:\")
 fn is_root_drive(path: &str) -> bool {
     let path = path.trim();
@@ -404,8 +411,15 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     .skip_taskbar(true)
     .minimizable(false);
 
+    #[cfg(target_os = "linux")]
+    let builder = builder
+        .icon(tauri::include_image!("./icons/128x128.png"))
+        .expect("failed to set Linux window icon on main_popup");
+
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "linux")]
+            apply_linux_window_icon(&window);
             // Set up close request handler for fast popup launch
             let window_clone = window.clone();
             window.on_window_event(move |event| {
@@ -499,6 +513,11 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         .minimizable(false);
 
     #[cfg(target_os = "linux")]
+    let builder = builder
+        .icon(tauri::include_image!("./icons/128x128.png"))
+        .expect("failed to set Linux window icon on add-drive");
+
+    #[cfg(target_os = "linux")]
     let builder = builder.transparent(false);
 
     #[cfg(not(target_os = "linux"))]
@@ -520,6 +539,8 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "linux")]
+            apply_linux_window_icon(&window);
             move_window_safe(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
@@ -561,6 +582,11 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     .decorations(false)
     .minimizable(true);
 
+    #[cfg(target_os = "linux")]
+    let builder = builder
+        .icon(tauri::include_image!("./icons/128x128.png"))
+        .expect("failed to set Linux window icon on settings");
+
     // Platform-specific: title_bar_style and hidden_title are macOS-only
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -569,6 +595,8 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "linux")]
+            apply_linux_window_icon(&window);
             move_window_safe(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
@@ -615,9 +643,15 @@ fn linux_escape_exec(path: &std::path::Path) -> String {
 #[cfg(target_os = "linux")]
 fn linux_desktop_entry(exec_path: &std::path::Path) -> String {
     let exec = linux_escape_exec(exec_path);
+    let icon = exec_path
+        .parent()
+        .map(|p| p.join("icons").join("128x128.png"))
+        .filter(|p| p.exists())
+        .map(|p| linux_escape_exec(&p))
+        .unwrap_or_else(|| "cloudreve".to_string());
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Cloudreve Desktop\nComment=Cloudreve Desktop Sync Client\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false\nCategories=Network;Utility;\n",
-        exec
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Cloudreve Desktop\nComment=Cloudreve Desktop Sync Client\nExec={}\nIcon={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false\nCategories=Network;Utility;\n",
+        exec, icon
     )
 }
 
