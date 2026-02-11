@@ -1,9 +1,11 @@
+#[cfg_attr(target_os = "linux", path = "cfapi_linux/mod.rs")]
 pub mod cfapi;
 pub mod config;
 pub mod drive;
 pub mod events;
 pub mod inventory;
 pub mod logging;
+#[cfg(target_os = "windows")]
 pub mod shellext;
 pub mod tasks;
 pub mod uploader;

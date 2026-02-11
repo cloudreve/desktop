@@ -3,8 +3,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use cloudreve_api::models::uri::CrUri;
 use url::Url;
+#[cfg(target_os = "windows")]
 use widestring::U16CString;
-use windows::Win32::UI::Shell::{SHCNE_ID, SHCNF_PATHW, SHChangeNotify};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Shell::SHCNE_ID;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Shell::{SHCNF_PATHW, SHChangeNotify};
+
+#[cfg(target_os = "linux")]
+#[allow(non_camel_case_types)]
+pub type SHCNE_ID = u32;
+#[cfg(target_os = "linux")]
+pub const SHCNE_ATTRIBUTES: SHCNE_ID = 0;
 
 use crate::drive::mounts::DriveConfig;
 
@@ -93,6 +103,7 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
 }
 
 // notify_shell_change notify the shell to refresh the file or directory
+#[cfg(target_os = "windows")]
 pub fn notify_shell_change(path: &PathBuf, event: SHCNE_ID) -> Result<()> {
     let utf16_path = U16CString::from_os_str(path.as_path())?;
     unsafe {
@@ -103,5 +114,17 @@ pub fn notify_shell_change(path: &PathBuf, event: SHCNE_ID) -> Result<()> {
             None,
         );
     }
+    Ok(())
+}
+
+// Linux file managers generally detect metadata/file updates via filesystem events.
+// Keep this API as a no-op for cross-platform call sites.
+#[cfg(target_os = "linux")]
+pub fn notify_shell_change(path: &PathBuf, _event: SHCNE_ID) -> Result<()> {
+    tracing::trace!(
+        target: "drive::utils",
+        path = %path.display(),
+        "notify_shell_change is a no-op on Linux"
+    );
     Ok(())
 }

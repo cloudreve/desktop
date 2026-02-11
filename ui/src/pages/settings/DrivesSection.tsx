@@ -8,6 +8,8 @@ import {
   Tooltip,
   Link,
   Divider,
+  Switch,
+  FormControlLabel,
 } from "@mui/material";
 import {
   FolderOpen as FolderOpenIcon,
@@ -22,6 +24,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { type as osType } from "@tauri-apps/plugin-os";
 import type { DriveInfo } from "./types";
 import {  SecondaryButton, SecondaryErrorButton } from "../../common/StyledComponent";
 import { ask } from '@tauri-apps/plugin-dialog';
@@ -42,12 +45,16 @@ interface DriveInfoResponse {
     used: number;
     label: string;
   };
+  linux_mount_mode?: "fuse" | "sync";
+  linux_fuse_mounted?: boolean;
+  linux_fuse_enabled?: boolean;
 }
 
 export default function DrivesSection() {
   const { t } = useTranslation();
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isLinux, setIsLinux] = useState(false);
   const isFetchingRef = useRef(false);
 
   const fetchDrives = useCallback(async () => {
@@ -73,6 +80,14 @@ export default function DrivesSection() {
   useEffect(() => {
     fetchDrives();
   }, [fetchDrives]);
+
+  useEffect(() => {
+    try {
+      setIsLinux(osType().toLowerCase() === "linux");
+    } catch {
+      setIsLinux(false);
+    }
+  }, []);
 
   const handleDelete = async (driveId: string, driveName: string) => {
     const confirmed = await ask(t("settings.deleteDriveConfirm", { name: driveName }), {
@@ -123,6 +138,15 @@ export default function DrivesSection() {
       await invoke("show_add_drive_window");
     } catch (error) {
       console.error("Failed to open add drive window:", error);
+    }
+  };
+
+  const handleToggleFuseMount = async (drive: DriveInfo, mounted: boolean) => {
+    try {
+      await invoke("set_linux_drive_mounted", { driveId: drive.id, mounted });
+      await fetchDrives();
+    } catch (error) {
+      console.error("Failed to toggle Linux FUSE mount:", error);
     }
   };
 
@@ -349,6 +373,19 @@ export default function DrivesSection() {
                     gap: 1,
                   }}
                 >
+                  {isLinux && drive.linux_mount_mode === "fuse" && (
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          size="small"
+                          checked={Boolean(drive.linux_fuse_mounted)}
+                          onChange={(e) => handleToggleFuseMount(drive, e.target.checked)}
+                        />
+                      }
+                      label={t("settings.fuseMounted")}
+                    />
+                  )}
+
                   {drive.status === "credential_expired" && (
                     <SecondaryButton
                       size="small"

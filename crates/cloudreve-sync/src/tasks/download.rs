@@ -23,7 +23,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -233,27 +233,31 @@ impl<'a> DownloadTask<'a> {
             return Ok(());
         }
 
-        // Check if file is a placeholder and is hydrated (has content on disk)
-        if !local_file_info.is_placeholder() {
-            info!(
-                target: "tasks::download",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "File is not a placeholder, skipping download"
-            );
-            return Ok(());
-        }
+        // On Windows we require a hydrated placeholder before replacing content.
+        // Linux full-sync mode does not use placeholders.
+        #[cfg(target_os = "windows")]
+        {
+            if !local_file_info.is_placeholder() {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    local_path = %self.task.payload.local_path_display(),
+                    "File is not a placeholder, skipping download"
+                );
+                return Ok(());
+            }
 
-        // partial_on_disk means the file content is NOT fully present locally
-        // We need the file to be hydrated (NOT partial_on_disk) to replace its content
-        if local_file_info.partial_on_disk() {
-            info!(
-                target: "tasks::download",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "File is not fully hydrated, skipping download - file must be hydrated first"
-            );
-            return Ok(());
+            // partial_on_disk means the file content is NOT fully present locally.
+            // We need the file to be hydrated (NOT partial_on_disk) to replace its content.
+            if local_file_info.partial_on_disk() {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    local_path = %self.task.payload.local_path_display(),
+                    "File is not fully hydrated, skipping download - file must be hydrated first"
+                );
+                return Ok(());
+            }
         }
 
         self.local_file_info = Some(local_file_info);

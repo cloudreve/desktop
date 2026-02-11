@@ -10,6 +10,9 @@ export interface DriveInfo {
   remote_path: string
   status: DriveStatus;
   capacity?: CapacitySummary;
+  linux_mount_mode?: "fuse" | "sync";
+  linux_fuse_mounted?: boolean;
+  linux_fuse_enabled?: boolean;
 }
 
 export type DriveStatus = "active" | "event_push_lost" | "credential_expired";

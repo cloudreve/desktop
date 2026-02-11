@@ -17,6 +17,17 @@ use std::time::Duration;
 use std::{fs, thread};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
+#[cfg(target_os = "linux")]
+fn linux_mount_mode_from_extra(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    extra
+        .get("linux_mount_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fuse")
+        .to_ascii_lowercase()
+}
+
 pub struct DriveManager {
     pub(super) drives: Arc<RwLock<HashMap<String, Arc<Mount>>>>,
     config_dir: PathBuf,
@@ -485,7 +496,10 @@ impl DriveManager {
         for mount in read_guard.values() {
             let config = mount.config.read().await;
             if let Some(ref sync_root) = config.sync_root_id {
+                #[cfg(target_os = "windows")]
                 let sync_root_str = sync_root.to_os_string().to_string_lossy().to_string();
+                #[cfg(target_os = "linux")]
+                let sync_root_str = sync_root.clone();
                 if sync_root_str == syncroot_id {
                     drop(config);
                     found_mount = Some(mount);
@@ -573,6 +587,27 @@ impl DriveManager {
                 }
             };
 
+            #[cfg(target_os = "linux")]
+            let linux_mount_mode = Some(linux_mount_mode_from_extra(&config.extra));
+            #[cfg(not(target_os = "linux"))]
+            let linux_mount_mode: Option<String> = None;
+
+            #[cfg(target_os = "linux")]
+            let linux_fuse_mounted = Some(mount.is_linux_fuse_mounted().await);
+            #[cfg(not(target_os = "linux"))]
+            let linux_fuse_mounted: Option<bool> = None;
+
+            #[cfg(target_os = "linux")]
+            let linux_fuse_enabled = Some(
+                config
+                    .extra
+                    .get("linux_fuse_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let linux_fuse_enabled: Option<bool> = None;
+
             drives_info.push(DriveInfo {
                 id: config.id.clone(),
                 name: config.name.clone(),
@@ -585,6 +620,9 @@ impl DriveManager {
                 user_id: config.user_id.clone(),
                 status,
                 capacity,
+                linux_mount_mode,
+                linux_fuse_mounted,
+                linux_fuse_enabled,
             });
         }
 
@@ -594,6 +632,21 @@ impl DriveManager {
     /// Get a command sender for external code to send commands to the manager
     pub fn get_command_sender(&self) -> mpsc::UnboundedSender<ManagerCommand> {
         self.command_tx.clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn set_linux_fuse_mounted(&self, id: &str, mounted: bool) -> Result<()> {
+        let mount = {
+            let read_guard = self.drives.read().await;
+            read_guard
+                .get(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?
+        };
+
+        mount.set_linux_fuse_mounted(mounted).await?;
+        self.persist().await?;
+        Ok(())
     }
 
     pub async fn shutdown(&self) {

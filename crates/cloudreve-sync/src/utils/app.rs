@@ -1,9 +1,10 @@
 use std::sync::{Arc, OnceLock};
-use windows::ApplicationModel;
+
 
 static APP_ROOT: OnceLock<Arc<String>> = OnceLock::new();
-
+#[cfg(target_os = "windows")]
 pub fn init_app_root() {
+    use windows::ApplicationModel;
     let path = ApplicationModel::Package::Current()
         .and_then(|p| p.InstalledLocation())
         .and_then(|l| l.Path())
@@ -12,7 +13,16 @@ pub fn init_app_root() {
 
     APP_ROOT.set(Arc::new(path)).ok();
 }
+#[cfg(target_os = "linux")]
+pub fn init_app_root() {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_default();
 
+    APP_ROOT.set(Arc::new(path)).ok();
+}
 pub fn get_app_root() -> AppRoot {
     AppRoot(APP_ROOT.get().expect("APP_ROOT not initialized").clone())
 }

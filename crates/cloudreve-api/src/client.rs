@@ -177,10 +177,10 @@ impl Client {
     ///
     /// # Example
     /// ```no_run
+    /// use cloudreve_api::{Client, ClientConfig};
     /// use std::sync::Arc;
-    /// use std::pin::Pin;
-    /// use std::future::Future;
     ///
+    /// let mut client = Client::new(ClientConfig::new("https://example.com"));
     /// client.set_on_credential_refreshed(Arc::new(|token| {
     ///     Box::pin(async move {
     ///         // Save token to storage

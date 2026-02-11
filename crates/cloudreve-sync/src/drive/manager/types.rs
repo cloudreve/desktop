@@ -97,6 +97,12 @@ pub struct DriveInfo {
     pub status: DriveInfoStatus,
     /// Capacity summary (None if not available)
     pub capacity: Option<CapacitySummary>,
+    /// Linux-only: selected mount mode ("fuse" or "sync")
+    pub linux_mount_mode: Option<String>,
+    /// Linux-only: whether the FUSE mount is currently active
+    pub linux_fuse_mounted: Option<bool>,
+    /// Linux-only: desired FUSE mount state persisted in config
+    pub linux_fuse_enabled: Option<bool>,
 }
 
 /// Drive status for the settings UI

@@ -8,7 +8,7 @@ use crate::{
         mounts::Mount,
         placeholder::CrPlaceholder,
         sync::{GroupedFsEvents, SyncMode},
-        utils::{local_path_to_cr_uri, notify_shell_change},
+        utils::{SHCNE_ATTRIBUTES, local_path_to_cr_uri, notify_shell_change},
     },
     inventory::ConflictState,
     tasks::TaskPayload,
@@ -39,7 +39,6 @@ use std::{
 };
 use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
-use windows::Win32::UI::Shell::SHCNE_ATTRIBUTES;
 const PAGE_SIZE: i32 = 1000;
 
 /// Generate a unique filename by appending a counter suffix before the extension.

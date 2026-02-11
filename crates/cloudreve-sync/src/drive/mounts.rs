@@ -1,13 +1,18 @@
+#[cfg(target_os = "windows")]
 use crate::cfapi::root::{
     Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder,
     SyncRootInfo,
 };
+#[cfg(target_os = "windows")]
 use crate::drive::callback::CallbackHandler;
+#[cfg(target_os = "linux")]
+use crate::drive::fuse;
 use crate::drive::commands::ManagerCommand;
 use crate::drive::commands::MountCommand;
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
+#[cfg(target_os = "windows")]
 use crate::drive::utils::recycle_bin_url;
 use crate::inventory::{DrivePropsUpdate, InventoryDb, TaskRecord};
 use crate::tasks::{TaskProgress, TaskQueue, TaskQueueConfig};
@@ -18,6 +23,7 @@ use cloudreve_api::api::user::UserApi;
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+#[cfg(target_os = "windows")]
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use std::{
@@ -28,8 +34,43 @@ use std::{
 use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
+#[cfg(target_os = "windows")]
 use url::Url;
+#[cfg(target_os = "windows")]
 use windows::Storage::Provider::StorageProviderSyncRootManager;
+
+#[cfg(target_os = "linux")]
+type SyncRootId = String;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxMountMode {
+    Fuse,
+    Sync,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_mode_from_config(config: &DriveConfig) -> LinuxMountMode {
+    match config
+        .extra
+        .get("linux_mount_mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("sync") => LinuxMountMode::Sync,
+        _ => LinuxMountMode::Fuse,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_enabled_from_config(config: &DriveConfig) -> bool {
+    config
+        .extra
+        .get("linux_fuse_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
     pub id: String,
@@ -128,7 +169,10 @@ type FsWatcher = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 pub struct Mount {
     pub config: Arc<RwLock<DriveConfig>>,
+    #[cfg(target_os = "windows")]
     connection: Option<Connection<CallbackHandler>>,
+    #[cfg(target_os = "linux")]
+    fuse_session: Arc<Mutex<Option<fuser::BackgroundSession>>>,
     pub command_tx: mpsc::UnboundedSender<MountCommand>,
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -240,7 +284,10 @@ impl Mount {
 
         Self {
             config: Arc::new(RwLock::new(config)),
+            #[cfg(target_os = "windows")]
             connection: None,
+            #[cfg(target_os = "linux")]
+            fuse_session: Arc::new(tokio::sync::Mutex::new(None)),
             command_tx,
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -353,74 +400,140 @@ impl Mount {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        if !StorageProviderSyncRootManager::IsSupported()
-            .context("Cloud Filter API is not supported")?
+        #[cfg(target_os = "windows")]
         {
-            return Err(anyhow::anyhow!("Cloud Filter API is not supported"));
-        }
-
-        let mut write_guard = self.config.write().await;
-
-        // if sync root id is not set, generate one
-        if write_guard.sync_root_id.is_none() {
-            write_guard.sync_root_id = Some(
-                generate_sync_root_id(
-                    &write_guard.instance_url,
-                    &write_guard.name,
-                    &write_guard.user_id,
-                    &write_guard.sync_path,
-                )
-                .context("failed to generate sync root id")?,
-            );
-        }
-
-        drop(write_guard);
-        let config = self.config.read().await;
-
-        let sync_root_id = config.sync_root_id.as_ref().unwrap();
-
-        // Register sync root if not registered
-        if !sync_root_id.is_registered()? {
-            tracing::info!(target: "drive::mounts", id = %self.id, "Registering sync root");
-            let mut sync_root_info = SyncRootInfo::default();
-            sync_root_info.set_display_name(config.name.clone());
-            sync_root_info.set_hydration_type(HydrationType::Full);
-            sync_root_info.set_population_type(PopulationType::Full);
-            if let Some(icon_path) = config.icon_path.as_ref() {
-                sync_root_info.set_icon(format!("{},0", icon_path));
+            if !StorageProviderSyncRootManager::IsSupported()
+                .context("Cloud Filter API is not supported")?
+            {
+                return Err(anyhow::anyhow!("Cloud Filter API is not supported"));
             }
-            sync_root_info.set_version("1.0.0");
-            sync_root_info
-                .set_recycle_bin_uri(recycle_bin_url(&config).unwrap_or_else(|_| "https://cloudreve.org".to_string()))
-                .context("failed to set recycle bin uri")?;
-            sync_root_info
-                .set_path(Path::new(&config.sync_path))
-                .context("failed to set sync root path")?;
-            sync_root_info.add_custom_state(t!("shared").as_ref(), 1)?;
-            sync_root_info.add_custom_state(t!("accessible").as_ref(), 2)?;
-            sync_root_id
-                .register(sync_root_info)
-                .context("failed to register sync root")?;
+
+            let mut write_guard = self.config.write().await;
+
+            // if sync root id is not set, generate one
+            if write_guard.sync_root_id.is_none() {
+                write_guard.sync_root_id = Some(
+                    generate_sync_root_id(
+                        &write_guard.instance_url,
+                        &write_guard.name,
+                        &write_guard.user_id,
+                        &write_guard.sync_path,
+                    )
+                    .context("failed to generate sync root id")?,
+                );
+            }
+
+            drop(write_guard);
+            let config = self.config.read().await;
+
+            let sync_root_id = config.sync_root_id.as_ref().unwrap();
+
+            // Register sync root if not registered
+            if !sync_root_id.is_registered()? {
+                tracing::info!(target: "drive::mounts", id = %self.id, "Registering sync root");
+                let mut sync_root_info = SyncRootInfo::default();
+                sync_root_info.set_display_name(config.name.clone());
+                sync_root_info.set_hydration_type(HydrationType::Full);
+                sync_root_info.set_population_type(PopulationType::Full);
+                if let Some(icon_path) = config.icon_path.as_ref() {
+                    sync_root_info.set_icon(format!("{},0", icon_path));
+                }
+                sync_root_info.set_version("1.0.0");
+                sync_root_info
+                    .set_recycle_bin_uri(recycle_bin_url(&config).unwrap_or_else(|_| "https://cloudreve.org".to_string()))
+                    .context("failed to set recycle bin uri")?;
+                sync_root_info
+                    .set_path(Path::new(&config.sync_path))
+                    .context("failed to set sync root path")?;
+                sync_root_info.add_custom_state(t!("shared").as_ref(), 1)?;
+                sync_root_info.add_custom_state(t!("accessible").as_ref(), 2)?;
+                sync_root_id
+                    .register(sync_root_info)
+                    .context("failed to register sync root")?;
+            }
+
+            // Add to search indexer for state management
+            if let Err(e) = sync_root_id.index() {
+                tracing::warn!(target: "drive::mounts", id = %self.id, error = %e, "Failed to add sync root to search indexer");
+            }
+
+            tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
+            let connection = Session::new()
+                .connect(
+                    &config.sync_path,
+                    CallbackHandler::new(
+                        self.command_tx.clone(),
+                        self.id.clone(),
+                        self.inventory.clone(),
+                    ),
+                )
+                .context("failed to connect to sync root")?;
+
+            self.connection = Some(connection);
         }
 
-        // Add to search indexer for state management
-        if let Err(e) = sync_root_id.index() {
-            tracing::warn!(target: "drive::mounts", id = %self.id, error = %e, "Failed to add sync root to search indexer");
-        }
-
-        tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
-        let connection = Session::new()
-            .connect(
-                &config.sync_path,
-                CallbackHandler::new(
-                    self.command_tx.clone(),
+        #[cfg(target_os = "linux")]
+        {
+            let (mount_mode, fuse_enabled, sync_path, id) = {
+                let config = self.config.read().await;
+                (
+                    linux_mount_mode_from_config(&config),
+                    linux_fuse_enabled_from_config(&config),
+                    config.sync_path.clone(),
                     self.id.clone(),
-                    self.inventory.clone(),
-                ),
-            )
-            .context("failed to connect to sync root")?;
+                )
+            };
+            match mount_mode {
+                LinuxMountMode::Sync => {
+                    tracing::info!(
+                        target: "drive::mounts",
+                        id = %id,
+                        sync_path = %sync_path.display(),
+                        "Using Linux direct directory full-sync mode (user selected)"
+                    );
+                    std::fs::create_dir_all(&sync_path)
+                        .with_context(|| format!("failed to ensure sync directory {}", sync_path.display()))?;
+                    let _ = fuse::clear_mount_marker(&sync_path, &id);
+                    *self.fuse_session.lock().await = None;
+                }
+                LinuxMountMode::Fuse => {
+                    if fuse::has_stale_mount_marker(&sync_path, &id).unwrap_or(false) {
+                        tracing::warn!(
+                            target: "drive::mounts",
+                            id = %id,
+                            sync_path = %sync_path.display(),
+                            "Detected stale Linux FUSE mount marker from previous run"
+                        );
+                        toast::send_general_text_toast(
+                            "Cloudreve Linux FUSE recovery",
+                            "Detected an unclean previous FUSE session. Recovering mount state.",
+                        );
+                    }
+                    if fuse_enabled {
+                        self.mount_linux_fuse().await?;
+                    } else {
+                        tracing::info!(
+                            target: "drive::mounts",
+                            id = %id,
+                            sync_path = %sync_path.display(),
+                            "Linux FUSE mode selected but currently unmounted (user toggle)"
+                        );
+                        let restored = fuse::restore_from_backend(&sync_path, &id).unwrap_or(0);
+                        if restored > 0 {
+                            tracing::info!(
+                                target: "drive::mounts",
+                                id = %id,
+                                restored = restored,
+                                "Recovered backend files while starting unmounted"
+                            );
+                        }
+                        let _ = fuse::clear_mount_marker(&sync_path, &id);
+                        *self.fuse_session.lock().await = None;
+                    }
+                }
+            }
+        }
 
-        self.connection = Some(connection);
         self.start_fs_watcher().await?;
         Ok(())
     }
@@ -595,10 +708,18 @@ impl Mount {
 
     pub async fn delete(&self) -> Result<()> {
         self.shutdown().await;
+        #[cfg(target_os = "windows")]
         if let Some(ref connection) = self.connection {
             connection.disconnect().context("faield to disconnect sync root")?;
         }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.fuse_session.lock().await.take();
+            let sync_path = self.config.read().await.sync_path.clone();
+            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
+        }
         self.task_queue.shutdown().await;
+        #[cfg(target_os = "windows")]
         if let Some(sync_root_id) = self.config.read().await.sync_root_id.as_ref() {
             if let Err(e) = sync_root_id.unregister() {
                 tracing::warn!(target: "drive::mounts", id=%self.id, error=%e, "Failed to unregister sync root");
@@ -614,6 +735,13 @@ impl Mount {
 
     pub async fn shutdown(&self) {
         tracing::info!(target: "drive::mounts", id=%self.id, "Shutting down Mount");
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.fuse_session.lock().await.take();
+            let sync_path = self.config.read().await.sync_path.clone();
+            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
+        }
 
         // Stop the remote event listener
         if let Some(handle) = self.remote_event_handle.lock().await.take() {
@@ -682,6 +810,121 @@ impl Mount {
         *self.props_refresh_handle.lock().await = Some(handle);
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn is_linux_fuse_mounted(&self) -> bool {
+        self.fuse_session.lock().await.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn set_linux_fuse_enabled_config(&self, enabled: bool) {
+        self.config
+            .write()
+            .await
+            .extra
+            .insert("linux_fuse_enabled".to_string(), serde_json::Value::Bool(enabled));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn mount_linux_fuse(&self) -> Result<()> {
+        let config = self.config.read().await;
+        toast::send_general_text_toast(
+            "Cloudreve Linux FUSE (Experimental)",
+            "Linux FUSE backend is experimental. Data layout and behavior may change.",
+        );
+        tracing::warn!(
+            target: "drive::mounts",
+            id = %self.id,
+            sync_path = %config.sync_path.display(),
+            "Starting experimental Linux FUSE mount"
+        );
+        match fuse::mount_experimental(&config.sync_path, &self.id) {
+            Ok(session) => {
+                drop(config);
+                *self.fuse_session.lock().await = Some(session);
+                self.set_linux_fuse_enabled_config(true).await;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "drive::mounts",
+                    id = %self.id,
+                    sync_path = %config.sync_path.display(),
+                    error = ?e,
+                    "FUSE mount failed; falling back to direct directory full-sync mode"
+                );
+                match fuse::restore_from_backend(&config.sync_path, &self.id) {
+                    Ok(restored) if restored > 0 => {
+                        tracing::warn!(
+                            target: "drive::mounts",
+                            id = %self.id,
+                            restored = restored,
+                            "Recovered files from FUSE backend before fallback"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(recover_err) => {
+                        tracing::error!(
+                            target: "drive::mounts",
+                            id = %self.id,
+                            error = ?recover_err,
+                            "Failed to recover files from FUSE backend before fallback"
+                        );
+                    }
+                }
+                toast::send_general_text_toast(
+                    "Cloudreve Linux FUSE unavailable",
+                    "FUSE mount failed. Falling back to direct directory full-sync mode.",
+                );
+                std::fs::create_dir_all(&config.sync_path)
+                    .with_context(|| format!("failed to ensure sync directory {}", config.sync_path.display()))?;
+                drop(config);
+                *self.fuse_session.lock().await = None;
+                self.set_linux_fuse_enabled_config(false).await;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn set_linux_fuse_mounted(&self, mounted: bool) -> Result<()> {
+        let mode = {
+            let config = self.config.read().await;
+            linux_mount_mode_from_config(&config)
+        };
+
+        if mode != LinuxMountMode::Fuse {
+            return Err(anyhow::anyhow!(
+                "Linux mount toggle is only available when linux_mount_mode is 'fuse'"
+            ));
+        }
+
+        let is_mounted = self.is_linux_fuse_mounted().await;
+        if mounted == is_mounted {
+            self.set_linux_fuse_enabled_config(mounted).await;
+            return Ok(());
+        }
+
+        if mounted {
+            self.mount_linux_fuse().await?;
+        } else {
+            let _ = self.fuse_session.lock().await.take();
+            let sync_path = self.config.read().await.sync_path.clone();
+            let restored = fuse::restore_from_backend(&sync_path, &self.id).unwrap_or(0);
+            if restored > 0 {
+                tracing::info!(
+                    target: "drive::mounts",
+                    id = %self.id,
+                    restored = restored,
+                    "Recovered backend files after unmount"
+                );
+            }
+            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
+            self.set_linux_fuse_enabled_config(false).await;
+        }
+
+        Ok(())
+    }
+
     /// Refresh drive props from the API (capacity and user settings)
     pub async fn refresh_drive_props(&self) -> Result<()> {
         tracing::debug!(target: "drive::mounts", id=%self.id, "Refreshing drive props");
@@ -729,6 +972,7 @@ impl Mount {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn generate_sync_root_id(
     instance_url: &str,
     _account_name: &str,

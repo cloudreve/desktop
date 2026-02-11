@@ -181,76 +181,88 @@ impl IgnoreMatcher {
 mod tests {
     use super::*;
 
+    fn root() -> PathBuf {
+        PathBuf::from("/tmp/cloudreve-sync-test-root")
+    }
+
+    fn p(parts: &[&str]) -> PathBuf {
+        let mut path = root();
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
     #[test]
     fn test_simple_pattern() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["*.log".to_string()];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\debug.log"));
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\subdir\\error.log"));
-        assert!(!matcher.is_match("C:\\Users\\test\\sync\\readme.txt"));
+        assert!(matcher.is_match(p(&["debug.log"])));
+        assert!(matcher.is_match(p(&["subdir", "error.log"])));
+        assert!(!matcher.is_match(p(&["readme.txt"])));
     }
 
     #[test]
     fn test_anchored_pattern() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["/build".to_string()];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\build"));
-        assert!(!matcher.is_match("C:\\Users\\test\\sync\\src\\build"));
+        assert!(matcher.is_match(p(&["build"])));
+        assert!(!matcher.is_match(p(&["src", "build"])));
     }
 
     #[test]
     fn test_directory_pattern() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["node_modules".to_string()];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\node_modules"));
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\project\\node_modules"));
+        assert!(matcher.is_match(p(&["node_modules"])));
+        assert!(matcher.is_match(p(&["project", "node_modules"])));
     }
 
     #[test]
     fn test_path_pattern() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["docs/*.md".to_string()];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\docs\\readme.md"));
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\project\\docs\\api.md"));
-        assert!(!matcher.is_match("C:\\Users\\test\\sync\\readme.md"));
+        assert!(matcher.is_match(p(&["docs", "readme.md"])));
+        assert!(matcher.is_match(p(&["project", "docs", "api.md"])));
+        assert!(!matcher.is_match(p(&["readme.md"])));
     }
 
     #[test]
     fn test_comment_and_empty_lines() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec![
             "# This is a comment".to_string(),
             "".to_string(),
             "  ".to_string(),
             "*.tmp".to_string(),
         ];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
-        assert_eq!(matcher.len(), 1); // Only *.tmp should be added
-        assert!(matcher.is_match("C:\\Users\\test\\sync\\file.tmp"));
+        assert_eq!(matcher.len(), 4); // *.tmp + 3 default temp-file patterns
+        assert!(matcher.is_match(p(&["file.tmp"])));
     }
 
     #[test]
     fn test_path_outside_sync_root() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["*.log".to_string()];
-        let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
+        let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 
         // Path outside sync root should never match
-        assert!(!matcher.is_match("C:\\Other\\path\\debug.log"));
+        assert!(!matcher.is_match(PathBuf::from("/var/tmp/debug.log")));
     }
 
     #[test]
     fn test_relative_path_matching() {
-        let sync_root = PathBuf::from("C:\\Users\\test\\sync");
+        let sync_root = root();
         let patterns = vec!["*.log".to_string(), "/build".to_string()];
         let matcher = IgnoreMatcher::new(&patterns, sync_root).unwrap();
 

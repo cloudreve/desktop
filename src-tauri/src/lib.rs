@@ -1,6 +1,8 @@
 use anyhow::Context;
-use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard, shellext::shell_service::ServiceHandle};
-use std::sync::{Arc, Mutex};
+use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard};
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::Mutex;
 use tauri::{
     async_runtime::spawn,
     menu::{Menu, MenuItem},
@@ -13,6 +15,9 @@ use tokio::sync::OnceCell;
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 mod commands;
 mod event_handler;
+
+#[cfg(target_os = "windows")]
+use cloudreve_sync::shellext::shell_service::ServiceHandle;
 
 #[macro_use]
 extern crate rust_i18n;
@@ -49,6 +54,7 @@ pub struct AppState {
     log_guard: LogGuard,
     // Keep the shell service handle alive for the entire application lifetime
     #[allow(dead_code)]
+    #[cfg(target_os = "windows")]
     shell_service: Mutex<ServiceHandle>,
 }
 
@@ -90,15 +96,19 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .context("Failed to load drive configurations")?;
 
     // Initialize and start the shell services (context menu handler) in a separate thread
+    #[cfg(target_os = "windows")]
     let mut shell_service =
         cloudreve_sync::shellext::shell_service::init_and_start_service_task(drive_manager.clone());
 
-    // Wait for shell services to initialize
-    if let Err(e) = shell_service.wait_for_init() {
-        tracing::error!(target: "main", "Warning: Failed to initialize shell services: {:?}", e);
-        tracing::info!(target: "main", "Continuing without context menu handler...");
-    } else {
-        tracing::info!(target: "main", "Shell services initialized successfully!");
+    #[cfg(target_os = "windows")]
+    {
+        // Wait for shell services to initialize
+        if let Err(e) = shell_service.wait_for_init() {
+            tracing::error!(target: "main", "Warning: Failed to initialize shell services: {:?}", e);
+            tracing::info!(target: "main", "Continuing without context menu handler...");
+        } else {
+            tracing::info!(target: "main", "Shell services initialized successfully!");
+        }
     }
 
     // Broadcast initial connection status
@@ -109,6 +119,7 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         drive_manager,
         event_broadcaster: event_broadcaster.clone(),
         log_guard,
+        #[cfg(target_os = "windows")]
         shell_service: Mutex::new(shell_service),
     };
 
@@ -203,9 +214,18 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let quit_i = MenuItem::with_id(app, "quit", t!("quit").as_ref(), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_i, &add_drive_i, &settings_i, &quit_i])?;
 
+    #[cfg(target_os = "linux")]
+    let tray_icon = tauri::include_image!("./icons/32x32.png");
+
+    #[cfg(not(target_os = "linux"))]
+    let tray_icon = app
+        .default_window_icon()
+        .cloned()
+        .context("Default window icon is missing")?;
+
     // Build tray icon
     TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(tray_icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -299,6 +319,7 @@ pub fn run() {
             commands::get_sync_status,
             commands::get_status_summary,
             commands::get_drives_info,
+            commands::set_linux_drive_mounted,
             commands::get_file_icon,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,

@@ -7,13 +7,17 @@ use cloudreve_sync::{
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{
-    utils::{config::WindowEffectsConfig, WindowEffect},
-    webview::WebviewWindowBuilder,
+    webview::{WebviewWindow, WebviewWindowBuilder},
     AppHandle, Manager, State, WebviewUrl,
 };
+#[cfg(not(target_os = "linux"))]
+use tauri::utils::{config::WindowEffectsConfig, WindowEffect};
 use tauri_plugin_frame::WebviewWindowExt;
-use tauri_plugin_positioner::{Position, WindowExt};
+use tauri_plugin_positioner::Position;
+#[cfg(not(target_os = "linux"))]
+use tauri_plugin_positioner::WindowExt;
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
 use windows::ApplicationModel::{StartupTask, StartupTaskState};
 
 /// Result type for Tauri commands
@@ -66,6 +70,7 @@ pub struct AddDriveArgs {
     pub local_path: String,
     pub user_id: String,
     pub drive_id: Option<String>,
+    pub linux_sync_mode: Option<String>,
 }
 
 /// Add a new drive configuration
@@ -108,7 +113,7 @@ pub async fn add_drive(
                 &config.user_id,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{:#}", e))?;
 
         // Persist drive configurations
         app_state
@@ -136,7 +141,13 @@ pub async fn add_drive(
         user_id: config.user_id,
         sync_root_id: None,
         ignore_patterns: Vec::new(),
-        extra: Default::default(),
+        extra: {
+            let mut extra = std::collections::HashMap::new();
+            if let Some(mode) = config.linux_sync_mode {
+                extra.insert("linux_mount_mode".to_string(), serde_json::Value::String(mode));
+            }
+            extra
+        },
     };
 
     // Add drive to manager
@@ -144,14 +155,14 @@ pub async fn add_drive(
         .drive_manager
         .add_drive(drive_config)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{:#}", e))?;
 
     // Persist drive configurations
     app_state
         .drive_manager
         .persist()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{:#}", e))?;
 
     Ok(id)
 }
@@ -227,6 +238,34 @@ pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<
         .map_err(|e| e.to_string())
 }
 
+/// Linux-only: toggle whether a drive is currently FUSE-mounted.
+#[tauri::command]
+pub async fn set_linux_drive_mounted(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    mounted: bool,
+) -> CommandResult<()> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+
+    #[cfg(target_os = "linux")]
+    {
+        app_state
+            .drive_manager
+            .set_linux_fuse_mounted(&drive_id, mounted)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (drive_id, mounted);
+        Err("set_linux_drive_mounted is only available on Linux".to_string())
+    }
+}
+
 /// File icon response containing base64 encoded RGBA pixel data
 #[derive(serde::Serialize)]
 pub struct FileIconResponse {
@@ -241,21 +280,55 @@ pub struct FileIconResponse {
 /// Get file icon for a given path
 /// Returns base64 encoded RGBA pixel data with dimensions
 #[tauri::command]
-pub async fn get_file_icon(path: String, size: Option<u16>) -> CommandResult<FileIconResponse> {
+pub async fn get_file_icon(
+    app: AppHandle,
+    path: String,
+    size: Option<u16>,
+) -> CommandResult<FileIconResponse> {
     let icon_size = size.unwrap_or(32);
 
-    // Run the blocking icon retrieval in a separate thread
-    let result =
-        tokio::task::spawn_blocking(move || file_icon_provider::get_file_icon(&path, icon_size))
-            .await
-            .map_err(|e| format!("Task join error: {}", e))?
-            .map_err(|e| format!("Failed to get file icon: {:?}", e))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use tokio::sync::oneshot;
 
-    Ok(FileIconResponse {
-        data: BASE64.encode(&result.pixels),
-        width: result.width,
-        height: result.height,
-    })
+        let (tx, rx) = oneshot::channel();
+        app.run_on_main_thread(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                file_icon_provider::get_file_icon(&path, icon_size)
+            }))
+            .map_err(|_| "GTK icon retrieval panicked".to_string())
+            .and_then(|r| r.map_err(|e| format!("Failed to get file icon: {:?}", e)));
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("Failed to run icon retrieval on main thread: {}", e))?;
+
+        let result = rx
+            .await
+            .map_err(|_| "Main-thread icon retrieval channel closed".to_string())??;
+
+        return Ok(FileIconResponse {
+            data: BASE64.encode(&result.pixels),
+            width: result.width,
+            height: result.height,
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Run the blocking icon retrieval in a separate thread
+        let result =
+            tokio::task::spawn_blocking(move || file_icon_provider::get_file_icon(&path, icon_size))
+                .await
+                .map_err(|e| format!("Task join error: {}", e))?
+                .map_err(|e| format!("Failed to get file icon: {:?}", e))?;
+
+        return Ok(FileIconResponse {
+            data: BASE64.encode(&result.pixels),
+            width: result.width,
+            height: result.height,
+        });
+    }
 }
 
 /// Show or create the main window (positioned at tray center)
@@ -268,11 +341,20 @@ pub fn show_main_window_center(app: &AppHandle) {
     show_main_window_at_position(app, Position::Center);
 }
 
+/// On Linux, skip positioner move to avoid plugin panic in certain DE/monitor setups.
+#[cfg(target_os = "linux")]
+fn move_window_safe(_window: &WebviewWindow, _position: Position) {}
+
+#[cfg(not(target_os = "linux"))]
+fn move_window_safe(window: &WebviewWindow, position: Position) {
+    let _ = window.move_window(position);
+}
+
 /// Internal function to show or create the main window at a specific position
 fn show_main_window_at_position(app: &AppHandle, position: Position) {
     // Check if window already exists
     if let Some(window) = app.get_webview_window("main_popup") {
-        let _ = window.move_window(position);
+        move_window_safe(&window, position);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -280,7 +362,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     }
 
     // Create new main window
-    match WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         "main_popup",
         WebviewUrl::App(get_url_with_lang("index.html/#/popup").into()),
@@ -291,9 +373,9 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     .visible(false)
     .decorations(false)
     .skip_taskbar(true)
-    .minimizable(false)
-    .build()
-    {
+    .minimizable(false);
+
+    match builder.build() {
         Ok(window) => {
             // Set up close request handler for fast popup launch
             let window_clone = window.clone();
@@ -308,7 +390,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                 }
             });
 
-            let _ = window.move_window(position);
+            move_window_safe(&window, position);
             let _ = window.show();
             let _ = window.set_focus();
         }
@@ -377,23 +459,29 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         return;
     }
 
-    // Create new window with mica effect
-    let effects = WindowEffectsConfig {
-        effects: vec![WindowEffect::Mica, WindowEffect::Acrylic],
-        state: None,
-        radius: None,
-        color: None,
-    };
-
+    // Create new window.
+    // Linux uses an opaque background to avoid transparent content issues on some compositors.
     let builder = WebviewWindowBuilder::new(app, "add-drive", WebviewUrl::App(url_path.into()))
         .title(title)
         .inner_size(470.0, 630.0)
         .resizable(false)
         .visible(false)
-        .transparent(true)
-        .effects(effects)
         .decorations(false)
         .minimizable(false);
+
+    #[cfg(target_os = "linux")]
+    let builder = builder.transparent(false);
+
+    #[cfg(not(target_os = "linux"))]
+    let builder = {
+        let effects = WindowEffectsConfig {
+            effects: vec![WindowEffect::Mica, WindowEffect::Acrylic],
+            state: None,
+            radius: None,
+            color: None,
+        };
+        builder.transparent(true).effects(effects)
+    };
 
     // Platform-specific: title_bar_style and hidden_title are macOS-only
     #[cfg(target_os = "macos")]
@@ -403,7 +491,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
 
     match builder.build() {
         Ok(window) => {
-            let _ = window.move_window(Position::Center);
+            move_window_safe(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
@@ -452,7 +540,7 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 
     match builder.build() {
         Ok(window) => {
-            let _ = window.move_window(Position::Center);
+            move_window_safe(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
@@ -464,9 +552,81 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 }
 
 /// The TaskId defined in AppxManifest.xml for the startup task
+#[cfg(target_os = "windows")]
 const STARTUP_TASK_ID: &str = "cloudreve";
+#[cfg(target_os = "linux")]
+const LINUX_AUTOSTART_ENTRY: &str = "cloudreve-desktop.desktop";
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_dir() -> CommandResult<std::path::PathBuf> {
+    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+        return Ok(std::path::PathBuf::from(xdg_config_home).join("autostart"));
+    }
+
+    let home = std::env::var("HOME")
+        .map_err(|_| "Failed to determine HOME for Linux autostart".to_string())?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".config")
+        .join("autostart"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_file_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(LINUX_AUTOSTART_ENTRY)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_escape_exec(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(' ', "\\ ")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_entry(exec_path: &std::path::Path) -> String {
+    let exec = linux_escape_exec(exec_path);
+    format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Cloudreve Desktop\nComment=Cloudreve Desktop Sync Client\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false\nCategories=Network;Utility;\n",
+        exec
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_get_auto_start_enabled_impl(autostart_dir: &std::path::Path) -> CommandResult<bool> {
+    Ok(linux_autostart_file_path(autostart_dir).exists())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_set_auto_start_impl(
+    enabled: bool,
+    autostart_dir: &std::path::Path,
+    exec_path: &std::path::Path,
+) -> CommandResult<bool> {
+    let entry_path = linux_autostart_file_path(autostart_dir);
+
+    if enabled {
+        std::fs::create_dir_all(autostart_dir)
+            .map_err(|e| format!("Failed to create autostart directory: {}", e))?;
+
+        let tmp_path = entry_path.with_extension("desktop.tmp");
+        let entry = linux_desktop_entry(exec_path);
+        std::fs::write(&tmp_path, entry)
+            .map_err(|e| format!("Failed to write autostart entry: {}", e))?;
+        std::fs::rename(&tmp_path, &entry_path)
+            .map_err(|e| format!("Failed to activate autostart entry: {}", e))?;
+        return Ok(true);
+    }
+
+    if entry_path.exists() {
+        std::fs::remove_file(&entry_path)
+            .map_err(|e| format!("Failed to remove autostart entry: {}", e))?;
+    }
+    Ok(false)
+}
 
 /// Get whether auto-start is enabled using Windows StartupTask API
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub async fn get_auto_start_enabled() -> CommandResult<bool> {
     tokio::task::spawn_blocking(|| {
@@ -489,7 +649,20 @@ pub async fn get_auto_start_enabled() -> CommandResult<bool> {
     .map_err(|e| format!("Task join error: {}", e))?
 }
 
+/// Linux implementation: XDG autostart via .desktop entry.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn get_auto_start_enabled() -> CommandResult<bool> {
+    tokio::task::spawn_blocking(|| {
+        let autostart_dir = linux_autostart_dir()?;
+        linux_get_auto_start_enabled_impl(&autostart_dir)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
 /// Set auto-start configuration using Windows StartupTask API
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
     tokio::task::spawn_blocking(move || {
@@ -516,6 +689,20 @@ pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
                 .map_err(|e| format!("Failed to disable startup task: {}", e))?;
             Ok(false)
         }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
+/// Linux implementation: XDG autostart via .desktop entry.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
+    tokio::task::spawn_blocking(move || {
+        let autostart_dir = linux_autostart_dir()?;
+        let exec_path =
+            std::env::current_exe().map_err(|e| format!("Failed to resolve current executable: {}", e))?;
+        linux_set_auto_start_impl(enabled, &autostart_dir, &exec_path)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -636,4 +823,39 @@ pub async fn open_log_folder() -> CommandResult<()> {
 
     showfile::show_path_in_file_manager(format!("{}\\", log_dir.display()));
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_autostart_tests {
+    use super::{
+        linux_autostart_file_path, linux_get_auto_start_enabled_impl, linux_set_auto_start_impl,
+    };
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn autostart_roundtrip_enable_disable() {
+        let dir = TempDir::new().expect("create temp dir");
+        let autostart_dir = dir.path().join("autostart");
+        let fake_exec = dir.path().join("cloudreve-bin");
+        fs::write(&fake_exec, b"#!/bin/sh\necho cloudreve\n").expect("write fake executable");
+
+        let enabled =
+            linux_set_auto_start_impl(true, &autostart_dir, &fake_exec).expect("enable autostart");
+        assert!(enabled);
+
+        let file = linux_autostart_file_path(&autostart_dir);
+        assert!(file.exists());
+        let content = fs::read_to_string(&file).expect("read desktop entry");
+        assert!(content.contains("Name=Cloudreve Desktop"));
+        assert!(content.contains("Exec="));
+
+        let status = linux_get_auto_start_enabled_impl(&autostart_dir).expect("get status");
+        assert!(status);
+
+        let disabled =
+            linux_set_auto_start_impl(false, &autostart_dir, &fake_exec).expect("disable");
+        assert!(!disabled);
+        assert!(!file.exists());
+    }
 }

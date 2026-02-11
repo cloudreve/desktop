@@ -1,23 +1,31 @@
 use crate::drive::commands::ManagerCommand;
 use crate::drive::manager::DriveManager;
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::{path::PathBuf, sync::Mutex};
 use windows::{
+    #[cfg(target_os = "windows")]
     Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, BitmapTransform},
+    #[cfg(target_os = "windows")]
     Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
-    Win32::{Foundation::*, Graphics::Gdi, System::Com::*, UI::Shell::*},
+    #[cfg(target_os = "windows")]
+    Win32::{Foundation::*, Graphics::Gdi, UI::Shell::*},
+    Win32::{Foundation::*, System::Com::*},
     core::*,
 };
 
 pub const CLSID_THUMBNAIL_PROVIDER: GUID = GUID::from_u128(0x3d781652_78c5_4038_87a4_ec5940ab560a);
 
+#[cfg(target_os = "windows")]
 #[implement(IThumbnailProvider, IInitializeWithItem)]
 pub struct ThumbnailProvider {
     drive_manager: Arc<DriveManager>,
     path: Arc<Mutex<Option<PathBuf>>>,
 }
 
+#[cfg(target_os = "windows")]
 impl ThumbnailProvider {
     pub fn new(drive_manager: Arc<DriveManager>) -> Self {
         Self {
@@ -128,6 +136,7 @@ impl ThumbnailProvider {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     fn GetThumbnail(
         &self,
@@ -189,6 +198,7 @@ impl IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl IInitializeWithItem_Impl for ThumbnailProvider_Impl {
     fn Initialize(&self, _psi: Option<&IShellItem>, _riid: u32) -> Result<()> {
         tracing::trace!(target: "shellext::thumbnail", riid = _riid, "Initializing thumbnail provider");
@@ -210,15 +220,28 @@ impl IInitializeWithItem_Impl for ThumbnailProvider_Impl {
 // Class factory for creating instances of our context menu handler
 #[implement(IClassFactory)]
 pub struct ThumbnailProviderFactory {
+    #[cfg(target_os = "windows")]
     drive_manager: Arc<DriveManager>,
+    #[cfg(not(target_os = "windows"))]
+    _drive_manager: Arc<DriveManager>,
 }
 
 impl ThumbnailProviderFactory {
     pub fn new(drive_manager: Arc<DriveManager>) -> Self {
-        Self { drive_manager }
+        #[cfg(target_os = "windows")]
+        {
+            return Self { drive_manager };
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Self {
+                _drive_manager: drive_manager,
+            };
+        }
     }
 }
 
+#[cfg(target_os = "windows")]
 impl IClassFactory_Impl for ThumbnailProviderFactory_Impl {
     fn CreateInstance(
         &self,
@@ -234,6 +257,22 @@ impl IClassFactory_Impl for ThumbnailProviderFactory_Impl {
         let handler: IUnknown = handler.into();
 
         unsafe { handler.query(iid, result).ok() }
+    }
+
+    fn LockServer(&self, _lock: BOOL) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IClassFactory_Impl for ThumbnailProviderFactory_Impl {
+    fn CreateInstance(
+        &self,
+        _outer: Option<&IUnknown>,
+        _iid: *const GUID,
+        _result: *mut *mut core::ffi::c_void,
+    ) -> Result<()> {
+        Err(Error::from(CLASS_E_CLASSNOTAVAILABLE))
     }
 
     fn LockServer(&self, _lock: BOOL) -> Result<()> {
