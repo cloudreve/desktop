@@ -1,4 +1,4 @@
-import { Box, Button, CircularProgress, Container, InputAdornment, MenuItem, Snackbar, Typography } from "@mui/material";
+import { Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from '@tauri-apps/api/core';
@@ -23,8 +23,6 @@ import { type as osType } from "@tauri-apps/plugin-os";
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
 type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
-type LinuxSyncMode = "fuse" | "sync";
-
 interface OAuthCallbackData {
   code: string;
   state: string;
@@ -101,7 +99,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [localPath, setLocalPath] = useState("");
   const [driveName, setDriveName] = useState(driveNameQuery ? decodeURIComponent(driveNameQuery) : "");
   const [isLinux, setIsLinux] = useState(false);
-  const [linuxSyncMode, setLinuxSyncMode] = useState<LinuxSyncMode>("fuse");
   const lastFetchedUrl = useRef<string>("");
   const currentIconUrl = useRef<string | undefined>(undefined);
   const pkceSessionRef = useRef<PKCESession | null>(null);
@@ -346,7 +343,8 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           remote_path: pkceSessionRef.current!.callbackData!.path,
           user_id: pkceSessionRef.current!.callbackData!.user_id || "",
           drive_id: isReauthorize ? driveId : undefined,
-          linux_sync_mode: !isReauthorize && isLinux ? linuxSyncMode : undefined,
+          // FUSE entry is hidden in UI for now; Linux always provisions in sync mode.
+          linux_sync_mode: !isReauthorize && isLinux ? "sync" : undefined,
         }
       });
       // Success - switch to success state
@@ -530,20 +528,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                       },
                     }}
                   />
-                )}
-
-                {!isReauthorize && isLinux && (
-                  <FilledTextField
-                    select
-                    fullWidth
-                    label={t("addDrive.linuxMode")}
-                    value={linuxSyncMode}
-                    onChange={(e) => setLinuxSyncMode(e.target.value as LinuxSyncMode)}
-                    variant="filled"
-                  >
-                    <MenuItem value="fuse">{t("addDrive.linuxModeFuse")}</MenuItem>
-                    <MenuItem value="sync">{t("addDrive.linuxModeSync")}</MenuItem>
-                  </FilledTextField>
                 )}
 
                 <Button

@@ -4,8 +4,9 @@ mod types;
 
 pub use types::*;
 
-use crate::drive::commands::ManagerCommand;
+use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
+use crate::drive::sync::SyncMode;
 use crate::EventBroadcaster;
 use crate::inventory::InventoryDb;
 use crate::tasks::TaskProgress;
@@ -193,6 +194,31 @@ impl DriveManager {
             .spawn_remote_event_processor(mount_arc.clone())
             .await;
         mount_arc.spawn_props_refresh_task().await;
+
+        #[cfg(target_os = "linux")]
+        {
+            let sync_root = mount_arc.get_sync_path().await;
+            if let Err(e) = mount_arc.command_tx.send(MountCommand::Sync {
+                local_paths: vec![sync_root.clone()],
+                mode: SyncMode::FullHierarchy,
+            }) {
+                tracing::warn!(
+                    target: "drive",
+                    id = %mount_arc.id,
+                    sync_root = %sync_root.display(),
+                    error = %e,
+                    "Failed to enqueue initial Linux full sync"
+                );
+            } else {
+                tracing::info!(
+                    target: "drive",
+                    id = %mount_arc.id,
+                    sync_root = %sync_root.display(),
+                    "Queued initial Linux full sync"
+                );
+            }
+        }
+
         let id = mount_arc.id.clone();
         write_guard.insert(id.clone(), mount_arc);
         Ok(id)

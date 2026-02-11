@@ -12,6 +12,8 @@ use crate::drive::commands::MountCommand;
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
+#[cfg(target_os = "linux")]
+use crate::drive::sync::SyncMode;
 #[cfg(target_os = "windows")]
 use crate::drive::utils::recycle_bin_url;
 use crate::inventory::{DrivePropsUpdate, InventoryDb, TaskRecord};
@@ -50,6 +52,10 @@ enum LinuxMountMode {
 }
 
 #[cfg(target_os = "linux")]
+/// Read Linux mount mode from drive config.
+///
+/// Defaults to `Fuse` when the field is missing to keep backward compatibility
+/// with existing persisted configs.
 fn linux_mount_mode_from_config(config: &DriveConfig) -> LinuxMountMode {
     match config
         .extra
@@ -64,6 +70,9 @@ fn linux_mount_mode_from_config(config: &DriveConfig) -> LinuxMountMode {
 }
 
 #[cfg(target_os = "linux")]
+/// Read whether Linux FUSE should be mounted from drive config.
+///
+/// Defaults to `true` for legacy configs that predate the explicit toggle.
 fn linux_fuse_enabled_from_config(config: &DriveConfig) -> bool {
     config
         .extra
@@ -493,7 +502,7 @@ impl Mount {
                     );
                     std::fs::create_dir_all(&sync_path)
                         .with_context(|| format!("failed to ensure sync directory {}", sync_path.display()))?;
-                    let _ = fuse::clear_mount_marker(&sync_path, &id);
+                    let _ = fuse::cleanup_backend_on_unmount(&sync_path, &id);
                     *self.fuse_session.lock().await = None;
                 }
                 LinuxMountMode::Fuse => {
@@ -518,7 +527,7 @@ impl Mount {
                             sync_path = %sync_path.display(),
                             "Linux FUSE mode selected but currently unmounted (user toggle)"
                         );
-                        let restored = fuse::restore_from_backend(&sync_path, &id).unwrap_or(0);
+                        let restored = fuse::cleanup_backend_on_unmount(&sync_path, &id).unwrap_or(0);
                         if restored > 0 {
                             tracing::info!(
                                 target: "drive::mounts",
@@ -527,7 +536,6 @@ impl Mount {
                                 "Recovered backend files while starting unmounted"
                             );
                         }
-                        let _ = fuse::clear_mount_marker(&sync_path, &id);
                         *self.fuse_session.lock().await = None;
                     }
                 }
@@ -716,7 +724,7 @@ impl Mount {
         {
             let _ = self.fuse_session.lock().await.take();
             let sync_path = self.config.read().await.sync_path.clone();
-            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
+            let _ = fuse::cleanup_backend_on_unmount(&sync_path, &self.id);
         }
         self.task_queue.shutdown().await;
         #[cfg(target_os = "windows")]
@@ -740,7 +748,7 @@ impl Mount {
         {
             let _ = self.fuse_session.lock().await.take();
             let sync_path = self.config.read().await.sync_path.clone();
-            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
+            let _ = fuse::cleanup_backend_on_unmount(&sync_path, &self.id);
         }
 
         // Stop the remote event listener
@@ -811,11 +819,13 @@ impl Mount {
     }
 
     #[cfg(target_os = "linux")]
+    /// Returns whether the Linux FUSE session is currently active in memory.
     pub async fn is_linux_fuse_mounted(&self) -> bool {
         self.fuse_session.lock().await.is_some()
     }
 
     #[cfg(target_os = "linux")]
+    /// Persist the Linux FUSE enabled flag into drive extra config.
     async fn set_linux_fuse_enabled_config(&self, enabled: bool) {
         self.config
             .write()
@@ -825,6 +835,10 @@ impl Mount {
     }
 
     #[cfg(target_os = "linux")]
+    /// Try mounting Linux FUSE backend for this drive.
+    ///
+    /// On failure, it rolls back migrated backend files and falls back to
+    /// directory sync mode to keep the drive usable.
     async fn mount_linux_fuse(&self) -> Result<()> {
         let config = self.config.read().await;
         toast::send_general_text_toast(
@@ -852,7 +866,7 @@ impl Mount {
                     error = ?e,
                     "FUSE mount failed; falling back to direct directory full-sync mode"
                 );
-                match fuse::restore_from_backend(&config.sync_path, &self.id) {
+                match fuse::cleanup_backend_on_unmount(&config.sync_path, &self.id) {
                     Ok(restored) if restored > 0 => {
                         tracing::warn!(
                             target: "drive::mounts",
@@ -886,6 +900,10 @@ impl Mount {
     }
 
     #[cfg(target_os = "linux")]
+    /// Toggle Linux FUSE mount state for a drive already configured in FUSE mode.
+    ///
+    /// When mounting succeeds, a full hierarchy sync is queued immediately so the
+    /// mounted view is populated. When unmounting, backend data is restored.
     pub async fn set_linux_fuse_mounted(&self, mounted: bool) -> Result<()> {
         let mode = {
             let config = self.config.read().await;
@@ -906,10 +924,30 @@ impl Mount {
 
         if mounted {
             self.mount_linux_fuse().await?;
+            let sync_root = self.config.read().await.sync_path.clone();
+            if let Err(e) = self.command_tx.send(MountCommand::Sync {
+                local_paths: vec![sync_root.clone()],
+                mode: SyncMode::FullHierarchy,
+            }) {
+                tracing::warn!(
+                    target: "drive::mounts",
+                    id = %self.id,
+                    sync_root = %sync_root.display(),
+                    error = %e,
+                    "Failed to enqueue Linux full sync after mounting FUSE"
+                );
+            } else {
+                tracing::info!(
+                    target: "drive::mounts",
+                    id = %self.id,
+                    sync_root = %sync_root.display(),
+                    "Queued Linux full sync after mounting FUSE"
+                );
+            }
         } else {
             let _ = self.fuse_session.lock().await.take();
             let sync_path = self.config.read().await.sync_path.clone();
-            let restored = fuse::restore_from_backend(&sync_path, &self.id).unwrap_or(0);
+            let restored = fuse::cleanup_backend_on_unmount(&sync_path, &self.id).unwrap_or(0);
             if restored > 0 {
                 tracing::info!(
                     target: "drive::mounts",
@@ -918,7 +956,6 @@ impl Mount {
                     "Recovered backend files after unmount"
                 );
             }
-            let _ = fuse::clear_mount_marker(&sync_path, &self.id);
             self.set_linux_fuse_enabled_config(false).await;
         }
 

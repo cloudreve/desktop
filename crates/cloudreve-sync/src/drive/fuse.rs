@@ -462,6 +462,10 @@ impl Filesystem for PassthroughFs {
     }
 }
 
+/// Move existing entries from mountpoint into backend root.
+///
+/// Migration only runs when backend root is empty; otherwise this is a no-op to
+/// avoid overwriting previously preserved data.
 fn move_existing_children(src_mountpoint: &Path, backend_root: &Path) -> Result<()> {
     let mut src_entries = fs::read_dir(src_mountpoint)
         .with_context(|| format!("failed to read mountpoint {}", src_mountpoint.display()))?;
@@ -492,15 +496,18 @@ fn move_existing_children(src_mountpoint: &Path, backend_root: &Path) -> Result<
     Ok(())
 }
 
+/// Build backend directory path used by the experimental FUSE passthrough.
 fn backend_root_for(sync_path: &Path, drive_id: &str) -> PathBuf {
     let parent = sync_path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".cloudreve_fuse_backend_{}", drive_id))
 }
 
+/// Return marker file path inside backend directory.
 fn marker_path(backend_root: &Path) -> PathBuf {
     backend_root.join(MOUNT_MARKER_FILE)
 }
 
+/// Write marker file indicating an active FUSE mount session.
 fn write_mount_marker(backend_root: &Path) -> Result<()> {
     let path = marker_path(backend_root);
     let mut f = File::create(&path)
@@ -509,6 +516,7 @@ fn write_mount_marker(backend_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove FUSE mount marker for a drive, if present.
 pub fn clear_mount_marker(sync_path: &Path, drive_id: &str) -> Result<()> {
     let backend_root = backend_root_for(sync_path, drive_id);
     let path = marker_path(&backend_root);
@@ -519,11 +527,15 @@ pub fn clear_mount_marker(sync_path: &Path, drive_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check whether a stale FUSE mount marker exists for a drive.
 pub fn has_stale_mount_marker(sync_path: &Path, drive_id: &str) -> Result<bool> {
     let backend_root = backend_root_for(sync_path, drive_id);
     Ok(marker_path(&backend_root).exists())
 }
 
+/// Restore backend entries back into sync path.
+///
+/// Existing destination entries are preserved and not overwritten.
 fn restore_backend_children(backend_root: &Path, sync_path: &Path) -> Result<usize> {
     if !backend_root.exists() {
         return Ok(0);
@@ -565,6 +577,7 @@ fn restore_backend_children(backend_root: &Path, sync_path: &Path) -> Result<usi
     Ok(restored)
 }
 
+/// Restore backend content for a drive without deleting backend directory.
 pub fn restore_from_backend(sync_path: &Path, drive_id: &str) -> Result<usize> {
     let backend_root = backend_root_for(sync_path, drive_id);
     fs::create_dir_all(sync_path)
@@ -572,6 +585,39 @@ pub fn restore_from_backend(sync_path: &Path, drive_id: &str) -> Result<usize> {
     restore_backend_children(&backend_root, sync_path)
 }
 
+/// Restore backend content and clean marker/backend on unmount.
+///
+/// Returns the number of restored top-level entries.
+pub fn cleanup_backend_on_unmount(sync_path: &Path, drive_id: &str) -> Result<usize> {
+    let backend_root = backend_root_for(sync_path, drive_id);
+    fs::create_dir_all(sync_path)
+        .with_context(|| format!("failed to ensure sync path {}", sync_path.display()))?;
+    let restored = restore_backend_children(&backend_root, sync_path)?;
+
+    let marker = marker_path(&backend_root);
+    if marker.exists() {
+        fs::remove_file(&marker)
+            .with_context(|| format!("failed to remove mount marker {}", marker.display()))?;
+    }
+
+    if backend_root.exists() {
+        if fs::read_dir(&backend_root)
+            .with_context(|| format!("failed to inspect backend {}", backend_root.display()))?
+            .next()
+            .is_none()
+        {
+            fs::remove_dir(&backend_root)
+                .with_context(|| format!("failed to remove backend {}", backend_root.display()))?;
+        }
+    }
+
+    Ok(restored)
+}
+
+/// Mount the experimental Linux FUSE passthrough filesystem.
+///
+/// This uses a backend directory as the real data root and mounts a userspace
+/// filesystem at `sync_path`. If mount fails, it attempts rollback.
 pub fn mount_experimental(sync_path: &Path, drive_id: &str) -> Result<BackgroundSession> {
     fs::create_dir_all(sync_path)
         .with_context(|| format!("failed to create mountpoint {}", sync_path.display()))?;
@@ -610,7 +656,7 @@ pub fn mount_experimental(sync_path: &Path, drive_id: &str) -> Result<Background
 
 #[cfg(test)]
 mod tests {
-    use super::{move_existing_children, restore_backend_children};
+    use super::{cleanup_backend_on_unmount, move_existing_children, restore_backend_children};
     use std::fs;
     use tempfile::TempDir;
 
@@ -665,5 +711,22 @@ mod tests {
         assert!(sync.path().join("dir").join("b.txt").exists());
         assert!(backend.path().join("a.txt").exists());
         assert!(!backend.path().join("dir").exists());
+    }
+
+    #[test]
+    fn cleanup_backend_on_unmount_removes_backend_dir_when_empty() {
+        let root = TempDir::new().expect("temp root");
+        let sync = root.path().join("sync");
+        fs::create_dir_all(&sync).expect("create sync");
+        let drive_id = "drive1";
+        let backend = root.path().join(format!(".cloudreve_fuse_backend_{}", drive_id));
+        fs::create_dir_all(&backend).expect("create backend");
+        fs::write(backend.join("a.txt"), b"x").expect("write backend file");
+        fs::write(backend.join(".cloudreve_fuse_active"), b"pid=1").expect("write marker");
+
+        let restored = cleanup_backend_on_unmount(&sync, drive_id).expect("cleanup");
+        assert_eq!(restored, 1);
+        assert!(sync.join("a.txt").exists());
+        assert!(!backend.exists());
     }
 }

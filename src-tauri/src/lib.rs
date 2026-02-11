@@ -127,9 +127,6 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .set(state)
         .map_err(|_| anyhow::anyhow!("App state already initialized"))?;
 
-    // Store in Tauri's managed state as well for commands
-    app.manage(AppStateHandle);
-
     tracing::info!(target: "main", "Tauri application setup complete");
 
     Ok(())
@@ -287,6 +284,10 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_prevent_default::debug())
         .setup(|app| {
+            // Register command state synchronously to avoid race where commands
+            // run before async init_sync_service finishes.
+            app.manage(AppStateHandle);
+
             #[cfg(desktop)]
             let _ = app.handle().plugin(tauri_plugin_positioner::init());
 

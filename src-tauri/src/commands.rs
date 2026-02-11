@@ -49,6 +49,30 @@ fn get_url_with_lang(base_path: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn validate_linux_fuse_mount_path(local_path: &str, linux_sync_mode: Option<&str>) -> CommandResult<()> {
+    let mode = linux_sync_mode.unwrap_or("fuse").to_ascii_lowercase();
+    if mode != "fuse" {
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(local_path);
+    if !path.exists() {
+        return Err("Linux FUSE mode requires selecting an existing empty directory.".to_string());
+    }
+    if !path.is_dir() {
+        return Err("Linux FUSE mode requires selecting a directory.".to_string());
+    }
+
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|e| format!("Failed to inspect selected mount directory: {}", e))?;
+    if entries.next().is_some() {
+        return Err("Linux FUSE mode requires an empty directory. Please select an empty folder.".to_string());
+    }
+
+    Ok(())
+}
+
 /// List all configured drives
 #[tauri::command]
 pub async fn list_drives(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveConfig>> {
@@ -86,6 +110,11 @@ pub async fn add_drive(
     // Validate local_path for new drives (not for reauthorization)
     if config.drive_id.is_none() && is_root_drive(&config.local_path) {
         return Err(t!("localPathCannotBeRootDrive").to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    if config.drive_id.is_none() {
+        validate_linux_fuse_mount_path(&config.local_path, config.linux_sync_mode.as_deref())?;
     }
 
     // Convert relative expiry times (seconds) to absolute RFC3339 timestamps

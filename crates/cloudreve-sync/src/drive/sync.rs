@@ -1,7 +1,7 @@
 use crate::{
     cfapi::{
         metadata::Metadata,
-        placeholder::{LocalFileInfo, PinState},
+        placeholder::LocalFileInfo,
         placeholder_file::PlaceholderFile,
     },
     drive::{
@@ -9,9 +9,13 @@ use crate::{
         placeholder::CrPlaceholder,
         utils::{local_path_to_cr_uri, remote_path_to_local_relative_path},
     },
-    inventory::{ConflictState, FileMetadata, MetadataEntry},
+    inventory::{FileMetadata, MetadataEntry},
     tasks::TaskPayload,
 };
+#[cfg(not(target_os = "linux"))]
+use crate::cfapi::placeholder::PinState;
+#[cfg(not(target_os = "linux"))]
+use crate::inventory::ConflictState;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use cloudreve_api::{
@@ -228,6 +232,7 @@ enum SyncAction {
 
 #[derive(Debug, Clone, Copy)]
 enum UploadReason {
+    #[cfg(not(target_os = "linux"))]
     RemoteMismatch,
     RemoteMissing,
 }
@@ -585,6 +590,35 @@ impl Mount {
                         "Failed to create placeholder and inventory"
                     );
                     aggregate_error.push(path.clone(), err);
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if remote.file_type != file_type::FOLDER {
+                            tracing::info!(
+                                target: "drive::sync",
+                                id = %self.id,
+                                path = %path.display(),
+                                "Queueing download task for newly created Linux file"
+                            );
+                            // Reuse the same behavior as QueueDownload: cancel stale/duplicate
+                            // tasks first, then enqueue a fresh download.
+                            let _ = self.task_queue.cancel_by_path(path.clone()).await;
+                            if let Err(err) = self
+                                .task_queue
+                                .enqueue(TaskPayload::download(path.clone()))
+                                .await
+                            {
+                                tracing::error!(
+                                    target: "drive::sync",
+                                    id = %self.id,
+                                    path = %path.display(),
+                                    error = ?err,
+                                    "Failed to enqueue initial download task"
+                                );
+                                aggregate_error.push(path.clone(), anyhow::Error::from(err));
+                            }
+                        }
+                    }
                 }
             }
             SyncAction::UpdateInventoryFromRemote {
@@ -1026,7 +1060,19 @@ impl Mount {
             return;
         }
 
-        if !etag_match || !modify_date_match {
+        #[cfg(target_os = "linux")]
+        let local_size_match = match u64::try_from(remote.size) {
+            Ok(remote_size) => local.file_size == Some(remote_size),
+            Err(_) => false,
+        };
+
+        #[cfg(target_os = "linux")]
+        let needs_file_refresh = !etag_match || !modify_date_match || !local_size_match;
+
+        #[cfg(not(target_os = "linux"))]
+        let needs_file_refresh = !etag_match || !modify_date_match;
+
+        if needs_file_refresh {
             self.plan_file_actions(path, remote, local, inventory, plan);
         }
     }
@@ -1078,6 +1124,26 @@ impl Mount {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    fn plan_file_actions(
+        &self,
+        path: &PathBuf,
+        remote: &FileResponse,
+        local: &LocalFileInfo,
+        inventory: Option<&FileMetadata>,
+        plan: &mut SyncPlan,
+    ) {
+        // Linux full-sync/FUSE flow does not use Windows placeholder states.
+        // When remote metadata differs, prefer refreshing from remote content.
+        let _ = local;
+        let _ = inventory;
+        plan.actions.push(SyncAction::QueueDownload {
+            path: path.clone(),
+            remote: remote.clone(),
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn plan_file_actions(
         &self,
         path: &PathBuf,
