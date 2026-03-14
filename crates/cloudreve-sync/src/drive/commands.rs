@@ -1,9 +1,4 @@
 use crate::{
-    cfapi::{
-        filter::ticket,
-        placeholder::{LocalFileInfo, OpenOptions, PinState},
-        utility::WriteAt,
-    },
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
@@ -11,9 +6,12 @@ use crate::{
         utils::{local_path_to_cr_uri, notify_shell_change},
     },
     inventory::ConflictState,
+    platform::types::HydrationWriter,
     tasks::TaskPayload,
     utils::toast,
 };
+#[cfg(target_os = "windows")]
+use crate::cfapi::placeholder::{LocalFileInfo, OpenOptions, PinState};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use cloudreve_api::{
@@ -39,7 +37,6 @@ use std::{
 };
 use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
-use windows::Win32::UI::Shell::SHCNE_ATTRIBUTES;
 const PAGE_SIZE: i32 = 1000;
 
 /// Generate a unique filename by appending a counter suffix before the extension.
@@ -87,13 +84,8 @@ pub struct GetPlacehodlerResult {
     pub remote_path: CrUri,
 }
 
-/// Messages sent from OS threads (SyncFilter callbacks) to the async processing task
-///
-/// # Safety
-/// This is safe because Windows CFAPI callbacks are designed to be invoked from arbitrary threads
-/// and the data contained in Request, ticket, and info types are meant to be passed between threads
-/// during the callback's lifetime.
-#[derive(Debug)]
+/// Messages sent from platform callbacks (e.g., Windows CFAPI) or internal logic
+/// to the async processing task.
 pub enum MountCommand {
     FetchPlaceholders {
         path: PathBuf,
@@ -106,7 +98,7 @@ pub enum MountCommand {
     CredentialInvalid,
     FetchData {
         path: PathBuf,
-        ticket: ticket::FetchData,
+        writer: Box<dyn HydrationWriter>,
         range: Range<u64>,
         response: Sender<Result<()>>,
     },
@@ -128,10 +120,40 @@ pub enum MountCommand {
     },
 }
 
-// SAFETY: Windows CFAPI is designed to allow callbacks from arbitrary threads.
-// The Request, ticket, and info types contain data that is valid for the duration
-// of the callback and can be safely transferred between threads.
+// HydrationWriter is Send+Sync, all other fields are Send.
+// This replaces the previous unsafe impl that was needed for ticket::FetchData.
 unsafe impl Send for MountCommand {}
+
+// MountCommand contains Box<dyn HydrationWriter> which is not Debug,
+// so we implement Debug manually.
+impl std::fmt::Debug for MountCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountCommand::FetchPlaceholders { path, .. } => {
+                f.debug_struct("FetchPlaceholders").field("path", path).finish()
+            }
+            MountCommand::RefreshCredentials { .. } => {
+                f.debug_struct("RefreshCredentials").finish()
+            }
+            MountCommand::CredentialInvalid => write!(f, "CredentialInvalid"),
+            MountCommand::FetchData { path, range, .. } => {
+                f.debug_struct("FetchData").field("path", path).field("range", range).finish()
+            }
+            MountCommand::ProcessFsEvents { .. } => {
+                f.debug_struct("ProcessFsEvents").finish()
+            }
+            MountCommand::Sync { local_paths, mode } => {
+                f.debug_struct("Sync").field("local_paths", local_paths).field("mode", mode).finish()
+            }
+            MountCommand::Rename { source, target, .. } => {
+                f.debug_struct("Rename").field("source", source).field("target", target).finish()
+            }
+            MountCommand::Renamed { source, destination } => {
+                f.debug_struct("Renamed").field("source", source).field("destination", destination).finish()
+            }
+        }
+    }
+}
 
 /// Commands for the DriveManager
 /// These can be sent from external sources like context menus or other UI components
@@ -201,7 +223,7 @@ impl Mount {
     pub async fn fetch_data(
         &self,
         path: PathBuf,
-        ticket: ticket::FetchData,
+        writer: Box<dyn HydrationWriter>,
         range: Range<u64>,
     ) -> Result<()> {
         let config = self.config.read().await;
@@ -281,33 +303,27 @@ impl Mount {
                 let aligned_size = (accumulator.len() / CHUNK_SIZE) * CHUNK_SIZE;
                 let write_data = accumulator.drain(..aligned_size).collect::<Vec<u8>>();
 
-                ticket.write_at(&write_data, current_offset).map_err(|e| {
-                    anyhow::anyhow!("failed to write data at offset {}: {:?}", current_offset, e)
-                })?;
+                writer.write_at(&write_data, current_offset)
+                    .context("failed to write data")?;
 
                 bytes_transferred += write_data.len() as u64;
                 current_offset += write_data.len() as u64;
 
-                // Report progress to Windows
-                ticket
-                    .report_progress(total_bytes, bytes_transferred)
-                    .map_err(|e| anyhow::anyhow!("failed to report progress: {:?}", e))?;
+                writer.report_progress(total_bytes, bytes_transferred)
+                    .context("failed to report progress")?;
             }
         }
 
         // Write any remaining data (last chunk, may be less than 4KB)
         if !accumulator.is_empty() {
-            ticket.write_at(&accumulator, current_offset).map_err(|e| {
-                anyhow::anyhow!("failed to write data at offset {}: {:?}", current_offset, e)
-            })?;
+            writer.write_at(&accumulator, current_offset)
+                .context("failed to write remaining data")?;
 
             bytes_transferred += accumulator.len() as u64;
             // current_offset += accumulator.len() as u64;
 
-            // Final progress report
-            ticket
-                .report_progress(total_bytes, bytes_transferred)
-                .map_err(|e| anyhow::anyhow!("failed to report progress: {:?}", e))?;
+            writer.report_progress(total_bytes, bytes_transferred)
+                .context("failed to report final progress")?;
         }
 
         tracing::debug!(
@@ -426,27 +442,35 @@ impl Mount {
         // Cancel ongoing/pending tasks
         match self.task_queue.cancel_by_path(source.clone()).await {
             Ok(0) => {
-                // Mark file as in-sync
-                tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync: OPEN");
-                match OpenOptions::new()
-                    .write_access()
-                    .exclusive()
-                    .open_with_retry(&destination)
-                    .await
+                // Mark file as in-sync (Windows-only: uses cfapi OpenOptions)
+                #[cfg(target_os = "windows")]
                 {
-                    Ok(mut handle) => {
-                        tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync");
-                        if let Err(e) = handle.mark_in_sync(true, None) {
-                            tracing::error!(target: "drive::commands", error = %e, "Failed to mark as in-sync");
-                            return Err(e.into());
+                    tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync: OPEN");
+                    match OpenOptions::new()
+                        .write_access()
+                        .exclusive()
+                        .open_with_retry(&destination)
+                        .await
+                    {
+                        Ok(mut handle) => {
+                            tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync");
+                            if let Err(e) = handle.mark_in_sync(true, None) {
+                                tracing::error!(target: "drive::commands", error = %e, "Failed to mark as in-sync");
+                                return Err(e.into());
+                            }
+                            tracing::trace!(target: "drive::commands", path = %destination.display(), "Marked file as in-sync: complete");
+                            Ok(())
                         }
-                        tracing::trace!(target: "drive::commands", path = %destination.display(), "Marked file as in-sync: complete");
-                        Ok(())
+                        Err(e) => {
+                            tracing::error!(target: "drive::commands", error = %e, "Failed to open file after retries");
+                            Err(e.into())
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(target: "drive::commands", error = %e, "Failed to open file after retries");
-                        Err(e.into())
-                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // No cfapi mark-in-sync on non-Windows
+                    Ok(())
                 }
             }
             Ok(count) => {
@@ -760,22 +784,32 @@ impl Mount {
                 continue;
             }
 
-            let to_file_info = match LocalFileInfo::from_path(event.paths[1].as_path()) {
-                Ok(info) => info,
-                Err(e) => {
-                    tracing::error!(target: "drive::commands", path = %event.paths[1].display(), error = %e, "Failed to get local file info");
-                    continue;
+            let (is_placeholder, in_sync) = {
+                #[cfg(target_os = "windows")]
+                {
+                    match LocalFileInfo::from_path(event.paths[1].as_path()) {
+                        Ok(info) => (info.is_placeholder(), info.in_sync()),
+                        Err(e) => {
+                            tracing::error!(target: "drive::commands", path = %event.paths[1].display(), error = %e, "Failed to get local file info");
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // On non-Windows, files are never cfapi placeholders
+                    (false, false)
                 }
             };
 
-            if to_file_info.is_placeholder() {
+            if is_placeholder {
                 tracing::debug!(target: "drive::commands", path = %event.paths[1].display(), "Skip for placeholder rename event");
                 continue;
             }
 
             // Cancel ongoing/pending tasks
             let result = self.task_queue.cancel_by_path(event.paths[0].clone()).await;
-            match (result, to_file_info.in_sync()) {
+            match (result, in_sync) {
                 (Ok(0), true) => {
                     tracing::debug!(target: "drive::commands", path = %event.paths[0].display(), "No ongoing/pending tasks");
                 }
@@ -812,73 +846,97 @@ impl Mount {
         );
 
         for (_, path) in path_uri_mappings {
-            let placeholder_info = match LocalFileInfo::from_path(path.as_path()) {
-                Ok(info) => info,
-                Err(e) => {
-                    tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to get local file info");
-                    continue;
-                }
-            };
-            if placeholder_info.is_directory() {
-                continue;
-            }
-
-            // For pinned file but not on disk, hydrate it
-            let pin_state = placeholder_info.pinned();
-            if pin_state == PinState::Pinned && placeholder_info.partial_on_disk() {
-                tracing::debug!(target: "drive::commands", path = %path.display(), "Hydrate pinned not on disk placeholder");
-                let mut placeholder = match OpenOptions::new().open_win32(path.as_path()) {
-                    Ok(p) => p,
+            // Platform-specific placeholder state handling
+            #[cfg(target_os = "windows")]
+            {
+                let placeholder_info = match LocalFileInfo::from_path(path.as_path()) {
+                    Ok(info) => info,
                     Err(e) => {
-                        tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to open win32 file");
+                        tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to get local file info");
                         continue;
                     }
                 };
-                if let Err(e) = placeholder.hydrate(0..) {
-                    tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to hydrate placeholder");
+                if placeholder_info.is_directory() {
                     continue;
                 }
-                tracing::trace!(target: "drive::commands", path = %path.display(), "Hydration complete");
-                _ = notify_shell_change(&path, SHCNE_ATTRIBUTES);
-                continue;
-            } else if pin_state == PinState::Unpinned {
-                tracing::debug!(target: "drive::commands", path = %path.display(), "Dehydrate unpinned file");
 
-                let mut placeholder = match OpenOptions::new()
-                    .open_win32_with_retry(path.as_path())
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "drive::commands",
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to open win32 file for dehydration after retries"
-                        );
+                // For pinned file but not on disk, hydrate it
+                let pin_state = placeholder_info.pinned();
+                if pin_state == PinState::Pinned && placeholder_info.partial_on_disk() {
+                    tracing::debug!(target: "drive::commands", path = %path.display(), "Hydrate pinned not on disk placeholder");
+                    let mut placeholder = match OpenOptions::new().open_win32(path.as_path()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to open win32 file");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = placeholder.hydrate(0..) {
+                        tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to hydrate placeholder");
                         continue;
                     }
-                };
+                    tracing::trace!(target: "drive::commands", path = %path.display(), "Hydration complete");
+                    _ = notify_shell_change(&path, windows::Win32::UI::Shell::SHCNE_ATTRIBUTES);
+                    continue;
+                } else if pin_state == PinState::Unpinned {
+                    tracing::debug!(target: "drive::commands", path = %path.display(), "Dehydrate unpinned file");
 
-                match placeholder.dehydrate(0..) {
-                    Ok(_) => {
-                        tracing::trace!(target: "drive::commands", path = %path.display(), "Dehydration complete");
-                        _ = notify_shell_change(&path, SHCNE_ATTRIBUTES);
+                    let mut placeholder = match OpenOptions::new()
+                        .open_win32_with_retry(path.as_path())
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                target: "drive::commands",
+                                path = %path.display(),
+                                error = %e,
+                                "Failed to open win32 file for dehydration after retries"
+                            );
+                            continue;
+                        }
+                    };
+
+                    match placeholder.dehydrate(0..) {
+                        Ok(_) => {
+                            tracing::trace!(target: "drive::commands", path = %path.display(), "Dehydration complete");
+                            _ = notify_shell_change(&path, windows::Win32::UI::Shell::SHCNE_ATTRIBUTES);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "drive::commands",
+                                path = %path.display(),
+                                error = %e,
+                                "Failed to dehydrate placeholder"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "drive::commands",
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to dehydrate placeholder"
-                        );
-                    }
+                    continue;
                 }
-                continue;
-            }
 
-            // General modification, quque a upload task if not exist
-            if !placeholder_info.in_sync() {
+                // General modification, queue an upload task if not exist
+                if !placeholder_info.in_sync() {
+                    tracing::debug!(target: "drive::commands", path = %path.display(), "Queuing upload task for modified file");
+                    let payload = TaskPayload::upload(path.clone());
+                    let result = self
+                        .task_queue
+                        .enqueue(payload)
+                        .await
+                        .context("Failed to enqueue upload task");
+                    if result.is_err() {
+                        tracing::error!(target: "drive::commands", path = %path.display(), error = ?result, "Failed to enqueue upload task");
+                        continue;
+                    }
+                    continue;
+                }
+            } // end #[cfg(target_os = "windows")]
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                // On non-Windows, skip directory events and queue uploads for modified files
+                if path.is_dir() {
+                    continue;
+                }
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Queuing upload task for modified file");
                 let payload = TaskPayload::upload(path.clone());
                 let result = self
@@ -890,7 +948,6 @@ impl Mount {
                     tracing::error!(target: "drive::commands", path = %path.display(), error = ?result, "Failed to enqueue upload task");
                     continue;
                 }
-                continue;
             }
         }
 

@@ -14,7 +14,6 @@ use tauri::{
 use tauri_plugin_frame::WebviewWindowExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use uuid::Uuid;
-use windows::ApplicationModel::{StartupTask, StartupTaskState};
 
 /// Result type for Tauri commands
 type CommandResult<T> = Result<T, String>;
@@ -463,62 +462,83 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     }
 }
 
-/// The TaskId defined in AppxManifest.xml for the startup task
-const STARTUP_TASK_ID: &str = "cloudreve";
-
-/// Get whether auto-start is enabled using Windows StartupTask API
+/// Get whether auto-start is enabled
 #[tauri::command]
 pub async fn get_auto_start_enabled() -> CommandResult<bool> {
-    tokio::task::spawn_blocking(|| {
-        let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
-        let task = StartupTask::GetAsync(&task_id)
-            .map_err(|e| format!("Failed to get startup task: {}", e))?
-            .get()
-            .map_err(|e| format!("Failed to get startup task: {}", e))?;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::ApplicationModel::{StartupTask, StartupTaskState};
+        const STARTUP_TASK_ID: &str = "cloudreve";
 
-        let state = task
-            .State()
-            .map_err(|e| format!("Failed to get task state: {}", e))?;
-
-        Ok(matches!(
-            state,
-            StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy
-        ))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-}
-
-/// Set auto-start configuration using Windows StartupTask API
-#[tauri::command]
-pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
-    tokio::task::spawn_blocking(move || {
-        let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
-        let task = StartupTask::GetAsync(&task_id)
-            .map_err(|e| format!("Failed to get startup task: {}", e))?
-            .get()
-            .map_err(|e| format!("Failed to get startup task: {}", e))?;
-
-        if enabled {
-            // Request enable - may prompt user for consent
-            let new_state = task
-                .RequestEnableAsync()
-                .map_err(|e| format!("Failed to request enable: {}", e))?
+        tokio::task::spawn_blocking(|| {
+            let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
+            let task = StartupTask::GetAsync(&task_id)
+                .map_err(|e| format!("Failed to get startup task: {}", e))?
                 .get()
-                .map_err(|e| format!("Failed to enable startup task: {}", e))?;
+                .map_err(|e| format!("Failed to get startup task: {}", e))?;
+
+            let state = task
+                .State()
+                .map_err(|e| format!("Failed to get task state: {}", e))?;
 
             Ok(matches!(
-                new_state,
+                state,
                 StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy
             ))
-        } else {
-            task.Disable()
-                .map_err(|e| format!("Failed to disable startup task: {}", e))?;
-            Ok(false)
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // TODO: Implement XDG autostart or systemd user service on Linux
+        Ok(false)
+    }
+}
+
+/// Set auto-start configuration
+#[tauri::command]
+pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::ApplicationModel::{StartupTask, StartupTaskState};
+        const STARTUP_TASK_ID: &str = "cloudreve";
+
+        tokio::task::spawn_blocking(move || {
+            let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
+            let task = StartupTask::GetAsync(&task_id)
+                .map_err(|e| format!("Failed to get startup task: {}", e))?
+                .get()
+                .map_err(|e| format!("Failed to get startup task: {}", e))?;
+
+            if enabled {
+                let new_state = task
+                    .RequestEnableAsync()
+                    .map_err(|e| format!("Failed to request enable: {}", e))?
+                    .get()
+                    .map_err(|e| format!("Failed to enable startup task: {}", e))?;
+
+                Ok(matches!(
+                    new_state,
+                    StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy
+                ))
+            } else {
+                task.Disable()
+                    .map_err(|e| format!("Failed to disable startup task: {}", e))?;
+                Ok(false)
+            }
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // TODO: Implement XDG autostart or systemd user service on Linux
+        let _ = enabled;
+        Ok(false)
+    }
 }
 
 /// Set notification settings for credential expiry
@@ -634,6 +654,6 @@ pub async fn open_log_folder() -> CommandResult<()> {
         std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     }
 
-    showfile::show_path_in_file_manager(format!("{}\\", log_dir.display()));
+    showfile::show_path_in_file_manager(format!("{}{}", log_dir.display(), std::path::MAIN_SEPARATOR));
     Ok(())
 }

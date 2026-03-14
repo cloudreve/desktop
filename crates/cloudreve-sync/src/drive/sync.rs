@@ -1,9 +1,10 @@
+#[cfg(target_os = "windows")]
+use crate::cfapi::{
+    metadata::Metadata,
+    placeholder::{LocalFileInfo, PinState},
+    placeholder_file::PlaceholderFile,
+};
 use crate::{
-    cfapi::{
-        metadata::Metadata,
-        placeholder::{LocalFileInfo, PinState},
-        placeholder_file::PlaceholderFile,
-    },
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
@@ -12,6 +13,10 @@ use crate::{
     inventory::{ConflictState, FileMetadata, MetadataEntry},
     tasks::TaskPayload,
 };
+
+// On non-Windows, provide a minimal LocalFileInfo and PinState compatible with sync logic
+#[cfg(not(target_os = "windows"))]
+use self::compat::{LocalFileInfo, PinState};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use cloudreve_api::{
@@ -27,6 +32,7 @@ use notify_debouncer_full::notify::event::{
     AccessKind, CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode,
 };
 use notify_debouncer_full::{DebouncedEvent, notify::Event};
+#[cfg(target_os = "windows")]
 use nt_time::FileTime;
 use std::{
     collections::{HashMap, HashSet},
@@ -38,6 +44,7 @@ use std::{
 use tokio::task;
 use uuid::Uuid;
 
+#[cfg(target_os = "windows")]
 pub fn cloud_file_to_placeholder(
     file: &FileResponse,
     _local_path: &PathBuf,
@@ -1389,5 +1396,78 @@ impl Mount {
         }
 
         Ok((children, remote_files))
+    }
+}
+
+/// Compatibility module providing `LocalFileInfo` and `PinState` stubs for non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod compat {
+    use std::path::Path;
+    use std::time::SystemTime;
+    use anyhow::Result;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PinState {
+        Pinned,
+        Unpinned,
+        Unspecified,
+    }
+
+    /// Minimal LocalFileInfo for non-Windows platforms.
+    /// On non-Windows, there is no cfapi placeholder concept.
+    /// All files are treated as regular files (not placeholders).
+    #[derive(Debug, Clone)]
+    pub struct LocalFileInfo {
+        pub exists: bool,
+        pub is_directory: bool,
+        pub file_size: Option<u64>,
+        pub last_modified: Option<SystemTime>,
+    }
+
+    impl LocalFileInfo {
+        pub fn missing() -> Self {
+            Self {
+                exists: false,
+                is_directory: false,
+                file_size: None,
+                last_modified: None,
+            }
+        }
+
+        pub fn from_path(path: &Path) -> Result<Self> {
+            match std::fs::metadata(path) {
+                Ok(meta) => Ok(Self {
+                    exists: true,
+                    is_directory: meta.is_dir(),
+                    file_size: Some(meta.len()),
+                    last_modified: meta.modified().ok(),
+                }),
+                Err(_) => Ok(Self::missing()),
+            }
+        }
+
+        pub fn is_placeholder(&self) -> bool {
+            false
+        }
+
+        pub fn in_sync(&self) -> bool {
+            false
+        }
+
+        pub fn partial_on_disk(&self) -> bool {
+            false
+        }
+
+        pub fn is_directory(&self) -> bool {
+            self.is_directory
+        }
+
+        pub fn is_folder_populated(&self) -> bool {
+            self.is_directory && self.exists
+        }
+
+        pub fn pinned(&self) -> PinState {
+            PinState::Unspecified
+        }
     }
 }

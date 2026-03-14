@@ -1,7 +1,9 @@
-use crate::{
-    cfapi::placeholder::LocalFileInfo,
-    drive::{commands::MountCommand, mounts::Mount, sync::SyncMode},
-};
+use crate::drive::{commands::MountCommand, mounts::Mount, sync::SyncMode};
+
+#[cfg(target_os = "windows")]
+use crate::cfapi::placeholder::LocalFileInfo;
+#[cfg(not(target_os = "windows"))]
+use crate::drive::sync::compat::LocalFileInfo;
 use anyhow::{Context, Result};
 use cloudreve_api::{
     api::explorer::FileEventsApi,

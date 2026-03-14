@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use cloudreve_api::models::uri::CrUri;
 use url::Url;
-use widestring::U16CString;
-use windows::Win32::UI::Shell::{SHCNE_ID, SHCNF_PATHW, SHChangeNotify};
 
 use crate::drive::mounts::DriveConfig;
 
@@ -54,9 +52,6 @@ pub fn remote_path_to_local_relative_path(
 }
 
 /// Generate a URL to view a folder or file online.
-///
-/// For folders: pass the folder path as `folder_path` and None for `open_file`
-/// For files: pass the parent folder path as `folder_path` and the file path as `open_file`
 pub fn view_online_url(
     folder_path: &str,
     open_file: Option<&str>,
@@ -92,8 +87,12 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
     Ok(base.to_string())
 }
 
-// notify_shell_change notify the shell to refresh the file or directory
-pub fn notify_shell_change(path: &PathBuf, event: SHCNE_ID) -> Result<()> {
+/// Notify the shell to refresh the file or directory (Windows-only).
+#[cfg(target_os = "windows")]
+pub fn notify_shell_change(path: &PathBuf, event: windows::Win32::UI::Shell::SHCNE_ID) -> Result<()> {
+    use widestring::U16CString;
+    use windows::Win32::UI::Shell::{SHCNF_PATHW, SHChangeNotify};
+
     let utf16_path = U16CString::from_os_str(path.as_path())?;
     unsafe {
         SHChangeNotify(
@@ -103,5 +102,11 @@ pub fn notify_shell_change(path: &PathBuf, event: SHCNE_ID) -> Result<()> {
             None,
         );
     }
+    Ok(())
+}
+
+/// No-op shell notification on non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
+pub fn notify_shell_change(_path: &PathBuf, _event: u32) -> Result<()> {
     Ok(())
 }

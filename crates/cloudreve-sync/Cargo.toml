@@ -22,11 +22,6 @@ sha2 = "0.10"
 image = "0.24"
 url = "2.5"
 cloudreve-api = { path = "../cloudreve-api" }
-windows-core = "0.58.0"
-nt-time = "0.8.0"
-widestring = "1.0.2"
-flagset = "0.4.5"
-memoffset = "0.9.1"
 chrono = "0.4.42"
 diesel = { version = "2.1", features = ["sqlite", "r2d2"] }
 diesel_migrations = { version = "2.1", features = ["sqlite"] }
@@ -43,9 +38,21 @@ aes = "0.8"
 ctr = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
 globset = "0.4"
+
+[dependencies.uuid]
+version = "1.6"
+features = ["v4", "serde"]
+
+# Windows-only dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.58.0"
+nt-time = "0.8.0"
+widestring = "1.0.2"
+flagset = "0.4.5"
+memoffset = "0.9.1"
 win32_notif = { path = "../win32_notif" }
 
-[dependencies.windows]
+[target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58.0"
 features = [
     "implement",
@@ -79,12 +86,12 @@ features = [
     "Win32_UI_Notifications",
 ]
 
-[build-dependencies]
+[target.'cfg(target_os = "windows")'.build-dependencies]
 windows = { version = "0.58.0", features = ["Win32_Foundation"] }
 
-[dependencies.uuid]
-version = "1.6"
-features = ["v4", "serde"]
+# Linux-only dependencies (uncomment when implementing FUSE)
+# [target.'cfg(target_os = "linux")'.dependencies]
+# fuse2rs = "..."
 
 [dev-dependencies]
 tempfile = "3.8"

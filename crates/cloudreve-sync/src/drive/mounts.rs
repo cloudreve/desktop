@@ -1,8 +1,3 @@
-use crate::cfapi::root::{
-    Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder,
-    SyncRootInfo,
-};
-use crate::drive::callback::CallbackHandler;
 use crate::drive::commands::ManagerCommand;
 use crate::drive::commands::MountCommand;
 use crate::drive::event_blocker::EventBlocker;
@@ -10,6 +5,7 @@ use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
 use crate::drive::utils::recycle_bin_url;
 use crate::inventory::{DrivePropsUpdate, InventoryDb, TaskRecord};
+use crate::platform::provider::{ProviderConfig, SyncProvider};
 use crate::tasks::{TaskProgress, TaskQueue, TaskQueueConfig};
 use crate::utils::toast;
 use ::serde::{Deserialize, Serialize};
@@ -18,6 +14,7 @@ use cloudreve_api::api::user::UserApi;
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+#[cfg(target_os = "windows")]
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use std::{
@@ -29,7 +26,10 @@ use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use url::Url;
-use windows::Storage::Provider::StorageProviderSyncRootManager;
+
+#[cfg(target_os = "windows")]
+use crate::cfapi::root::{SyncRootId, SyncRootIdBuilder, SecurityId};
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
     pub id: String,
@@ -44,8 +44,13 @@ pub struct DriveConfig {
     pub enabled: bool,
     pub user_id: String,
 
-    // Windows CFAPI
+    // Platform-specific sync root identifier (serialized string)
+    #[cfg(target_os = "windows")]
     pub sync_root_id: Option<SyncRootId>,
+
+    // On non-Windows platforms, store a plain string identifier
+    #[cfg(not(target_os = "windows"))]
+    pub sync_root_id: Option<String>,
 
     /// List of gitignore-style patterns for files/directories to ignore during sync
     #[serde(default)]
@@ -128,7 +133,7 @@ type FsWatcher = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 pub struct Mount {
     pub config: Arc<RwLock<DriveConfig>>,
-    connection: Option<Connection<CallbackHandler>>,
+    provider: Mutex<Option<Box<dyn SyncProvider>>>,
     pub command_tx: mpsc::UnboundedSender<MountCommand>,
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -154,11 +159,6 @@ impl Mount {
         inventory: Arc<InventoryDb>,
         manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     ) -> Self {
-        // let task_config = TaskManagerConfig {
-        //     max_workers: 4,
-        //     completed_buffer_size: 100,
-        // };
-        // let task_manager = TaskManager::new(task_config);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         // initialize the client with the credentials
         let client_config = ClientConfig::new(config.instance_url.clone())
@@ -240,7 +240,7 @@ impl Mount {
 
         Self {
             config: Arc::new(RwLock::new(config)),
-            connection: None,
+            provider: Mutex::new(None),
             command_tx,
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -259,6 +259,8 @@ impl Mount {
         }
     }
 
+    // Provider is behind a Mutex; access it via lock when needed.
+
     pub async fn get_config(&self) -> DriveConfig {
         self.config.read().await.clone()
     }
@@ -274,29 +276,11 @@ impl Mount {
     }
 
     /// Check if an absolute path should be ignored based on the configured ignore patterns.
-    ///
-    /// The sync root prefix will be automatically stripped from the path before matching.
-    /// If the path is not under the sync root, it will not match any patterns.
-    ///
-    /// # Arguments
-    /// * `path` - The absolute path to check
-    ///
-    /// # Returns
-    /// `true` if the path matches any ignore pattern, `false` otherwise
     pub fn is_ignored<P: AsRef<Path>>(&self, path: P) -> bool {
         self.ignore_matcher.is_match(path)
     }
 
     /// Check if a filename should be ignored based on the configured ignore patterns.
-    ///
-    /// This is useful for quick checks on just the filename without the full path.
-    /// Note: This only matches patterns that don't contain path separators.
-    ///
-    /// # Arguments
-    /// * `filename` - The filename to check (without path)
-    ///
-    /// # Returns
-    /// `true` if the filename matches any ignore pattern, `false` otherwise
     pub fn is_ignored_filename(&self, filename: &str) -> bool {
         self.ignore_matcher.is_match_filename(filename)
     }
@@ -352,75 +336,75 @@ impl Mount {
         self.task_queue.ongoing_progress().await
     }
 
-    pub async fn start(&mut self) -> Result<()> {
-        if !StorageProviderSyncRootManager::IsSupported()
-            .context("Cloud Filter API is not supported")?
+    pub async fn start(&self) -> Result<()> {
+        // Platform-specific provider construction and startup
+        #[cfg(target_os = "windows")]
         {
-            return Err(anyhow::anyhow!("Cloud Filter API is not supported"));
-        }
+            use crate::platform::windows::WindowsSyncProvider;
+            use crate::drive::callback::CallbackHandler;
 
-        let mut write_guard = self.config.write().await;
-
-        // if sync root id is not set, generate one
-        if write_guard.sync_root_id.is_none() {
-            write_guard.sync_root_id = Some(
-                generate_sync_root_id(
-                    &write_guard.instance_url,
-                    &write_guard.name,
-                    &write_guard.user_id,
-                    &write_guard.sync_path,
-                )
-                .context("failed to generate sync root id")?,
-            );
-        }
-
-        drop(write_guard);
-        let config = self.config.read().await;
-
-        let sync_root_id = config.sync_root_id.as_ref().unwrap();
-
-        // Register sync root if not registered
-        if !sync_root_id.is_registered()? {
-            tracing::info!(target: "drive::mounts", id = %self.id, "Registering sync root");
-            let mut sync_root_info = SyncRootInfo::default();
-            sync_root_info.set_display_name(config.name.clone());
-            sync_root_info.set_hydration_type(HydrationType::Full);
-            sync_root_info.set_population_type(PopulationType::Full);
-            if let Some(icon_path) = config.icon_path.as_ref() {
-                sync_root_info.set_icon(format!("{},0", icon_path));
+            if !WindowsSyncProvider::is_supported()
+                .map_err(|e| anyhow::anyhow!("Cloud Filter API is not supported: {}", e))?
+            {
+                return Err(anyhow::anyhow!("Cloud Filter API is not supported"));
             }
-            sync_root_info.set_version("1.0.0");
-            sync_root_info
-                .set_recycle_bin_uri(recycle_bin_url(&config).unwrap_or_else(|_| "https://cloudreve.org".to_string()))
-                .context("failed to set recycle bin uri")?;
-            sync_root_info
-                .set_path(Path::new(&config.sync_path))
-                .context("failed to set sync root path")?;
-            sync_root_info.add_custom_state(t!("shared").as_ref(), 1)?;
-            sync_root_info.add_custom_state(t!("accessible").as_ref(), 2)?;
-            sync_root_id
-                .register(sync_root_info)
-                .context("failed to register sync root")?;
-        }
 
-        // Add to search indexer for state management
-        if let Err(e) = sync_root_id.index() {
-            tracing::warn!(target: "drive::mounts", id = %self.id, error = %e, "Failed to add sync root to search indexer");
-        }
+            let mut write_guard = self.config.write().await;
 
-        tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
-        let connection = Session::new()
-            .connect(
+            // if sync root id is not set, generate one
+            if write_guard.sync_root_id.is_none() {
+                write_guard.sync_root_id = Some(
+                    generate_sync_root_id(
+                        &write_guard.instance_url,
+                        &write_guard.name,
+                        &write_guard.user_id,
+                        &write_guard.sync_path,
+                    )
+                    .context("failed to generate sync root id")?,
+                );
+            }
+
+            drop(write_guard);
+            let config = self.config.read().await;
+
+            let provider_config = build_provider_config(&config)?;
+
+            let mut provider = WindowsSyncProvider::new();
+            provider.start(&provider_config)
+                .map_err(|e| anyhow::anyhow!("failed to start sync provider: {}", e))?;
+
+            tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
+            provider.connect(
                 &config.sync_path,
                 CallbackHandler::new(
                     self.command_tx.clone(),
                     self.id.clone(),
                     self.inventory.clone(),
                 ),
-            )
-            .context("failed to connect to sync root")?;
+            ).context("failed to connect to sync root")?;
 
-        self.connection = Some(connection);
+            *self.provider.lock().await = Some(Box::new(provider));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use crate::platform::linux::LinuxFuseProvider;
+
+            let config = self.config.read().await;
+            let provider_config = build_provider_config(&config)?;
+
+            let mut provider = LinuxFuseProvider::new();
+            provider.start(&provider_config)
+                .map_err(|e| anyhow::anyhow!("failed to start sync provider: {}", e))?;
+
+            *self.provider.lock().await = Some(Box::new(provider));
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            return Err(anyhow::anyhow!("Sync provider not supported on this platform"));
+        }
+
         self.start_fs_watcher().await?;
         Ok(())
     }
@@ -550,14 +534,14 @@ impl Mount {
                 }
                 MountCommand::FetchData {
                     path,
-                    ticket,
+                    writer,
                     range,
                     response,
                 } => {
                     let s_clone = s.clone();
                     let mount_id_clone = mount_id.clone();
                     spawn(async move {
-                        let result = s_clone.fetch_data(path, ticket, range).await;
+                        let result = s_clone.fetch_data(path, writer, range).await;
                         if let Err(e) = result {
                             tracing::error!(target: "drive::mounts", id = %mount_id_clone, error = ?e, "Failed to fetch data");
                             let _ = response.send(Err(e));
@@ -569,7 +553,6 @@ impl Mount {
                 }
                 MountCommand::ProcessFsEvents { events } => {
                     let s_clone = s.clone();
-                    //let mount_id_clone = mount_id.clone();
                     spawn(async move {
                         let _ = s_clone.process_fs_events(events).await;
                     });
@@ -595,16 +578,18 @@ impl Mount {
 
     pub async fn delete(&self) -> Result<()> {
         self.shutdown().await;
-        if let Some(ref connection) = self.connection {
-            connection.disconnect().context("faield to disconnect sync root")?;
+
+        // Stop the provider and unregister
+        if let Some(ref mut provider) = *self.provider.lock().await {
+            provider.stop()
+                .map_err(|e| anyhow::anyhow!("failed to stop provider: {}", e))?;
+            provider.unregister()
+                .map_err(|e| anyhow::anyhow!("failed to unregister provider: {}", e))?;
         }
+        *self.provider.lock().await = None;
+
         self.task_queue.shutdown().await;
-        if let Some(sync_root_id) = self.config.read().await.sync_root_id.as_ref() {
-            if let Err(e) = sync_root_id.unregister() {
-                tracing::warn!(target: "drive::mounts", id=%self.id, error=%e, "Failed to unregister sync root");
-                return Err(anyhow::anyhow!("Failed to unregister sync root: {}", e));
-            }
-        }
+
         if let Err(e) = self.inventory.nuke_drive(&self.id) {
             tracing::error!(target: "drive::mounts", id=%self.id, error=%e, "Failed to nuke drive");
         }
@@ -640,7 +625,6 @@ impl Mount {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping props refresh task");
             handle.abort();
         }
-        // self.queue.shutdown().await;
     }
 
     /// Spawn the periodic props refresh task
@@ -729,6 +713,37 @@ impl Mount {
     }
 }
 
+/// Build a ProviderConfig from a DriveConfig.
+fn build_provider_config(config: &DriveConfig) -> Result<ProviderConfig> {
+    // Serialize the sync root ID to a string for the platform-agnostic config
+    let provider_id = {
+        #[cfg(target_os = "windows")]
+        {
+            config.sync_root_id.as_ref()
+                .map(|id| serde_json::to_value(id).ok())
+                .flatten()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            config.sync_root_id.clone().unwrap_or_default()
+        }
+    };
+
+    Ok(ProviderConfig {
+        sync_path: config.sync_path.clone(),
+        display_name: config.name.clone(),
+        icon_path: config.icon_path.clone(),
+        provider_id,
+        instance_url: config.instance_url.clone(),
+        user_id: config.user_id.clone(),
+        remote_path: config.remote_path.clone(),
+        recycle_bin_uri: recycle_bin_url(config).unwrap_or_else(|_| "https://cloudreve.org".to_string()),
+    })
+}
+
+#[cfg(target_os = "windows")]
 fn generate_sync_root_id(
     instance_url: &str,
     _account_name: &str,
@@ -748,7 +763,6 @@ fn generate_sync_root_id(
     let hash_result = hasher.finalize();
 
     // Convert hash to hex string and truncate to reasonable length
-    // Use first 16 characters (64 bits) of the hash for the provider name
     let hash_hex = format!("{:x}", hash_result);
     let provider_name = format!("cloudreve{}", &hash_hex[..16]);
 

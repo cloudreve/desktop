@@ -1,9 +1,12 @@
+#[cfg(target_os = "windows")]
 pub mod cfapi;
 pub mod config;
 pub mod drive;
 pub mod events;
 pub mod inventory;
 pub mod logging;
+pub mod platform;
+#[cfg(target_os = "windows")]
 pub mod shellext;
 pub mod tasks;
 pub mod uploader;

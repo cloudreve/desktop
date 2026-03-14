@@ -165,7 +165,7 @@ impl DriveManager {
         }
 
         let mut write_guard = self.drives.write().await;
-        let mut mount = Mount::new(
+        let mount = Mount::new(
             config.clone(),
             self.inventory.clone(),
             self.command_tx.clone(),
@@ -485,7 +485,10 @@ impl DriveManager {
         for mount in read_guard.values() {
             let config = mount.config.read().await;
             if let Some(ref sync_root) = config.sync_root_id {
+                #[cfg(target_os = "windows")]
                 let sync_root_str = sync_root.to_os_string().to_string_lossy().to_string();
+                #[cfg(not(target_os = "windows"))]
+                let sync_root_str = sync_root.clone();
                 if sync_root_str == syncroot_id {
                     drop(config);
                     found_mount = Some(mount);

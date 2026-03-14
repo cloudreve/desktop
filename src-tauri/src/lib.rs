@@ -1,5 +1,7 @@
 use anyhow::Context;
-use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard, shellext::shell_service::ServiceHandle};
+use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard};
+#[cfg(target_os = "windows")]
+use cloudreve_sync::shellext::shell_service::ServiceHandle;
 use std::sync::{Arc, Mutex};
 use tauri::{
     async_runtime::spawn,
@@ -47,7 +49,8 @@ pub struct AppState {
     // Keep the log guard alive for the entire application lifetime
     #[allow(dead_code)]
     log_guard: LogGuard,
-    // Keep the shell service handle alive for the entire application lifetime
+    // Keep the shell service handle alive for the entire application lifetime (Windows only)
+    #[cfg(target_os = "windows")]
     #[allow(dead_code)]
     shell_service: Mutex<ServiceHandle>,
 }
@@ -89,17 +92,21 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .await
         .context("Failed to load drive configurations")?;
 
-    // Initialize and start the shell services (context menu handler) in a separate thread
-    let mut shell_service =
-        cloudreve_sync::shellext::shell_service::init_and_start_service_task(drive_manager.clone());
+    // Initialize and start the shell services (Windows only)
+    #[cfg(target_os = "windows")]
+    let shell_service = {
+        let mut shell_service =
+            cloudreve_sync::shellext::shell_service::init_and_start_service_task(drive_manager.clone());
 
-    // Wait for shell services to initialize
-    if let Err(e) = shell_service.wait_for_init() {
-        tracing::error!(target: "main", "Warning: Failed to initialize shell services: {:?}", e);
-        tracing::info!(target: "main", "Continuing without context menu handler...");
-    } else {
-        tracing::info!(target: "main", "Shell services initialized successfully!");
-    }
+        // Wait for shell services to initialize
+        if let Err(e) = shell_service.wait_for_init() {
+            tracing::error!(target: "main", "Warning: Failed to initialize shell services: {:?}", e);
+            tracing::info!(target: "main", "Continuing without context menu handler...");
+        } else {
+            tracing::info!(target: "main", "Shell services initialized successfully!");
+        }
+        shell_service
+    };
 
     // Broadcast initial connection status
     event_broadcaster.connection_status_changed(true);
@@ -109,6 +116,7 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         drive_manager,
         event_broadcaster: event_broadcaster.clone(),
         log_guard,
+        #[cfg(target_os = "windows")]
         shell_service: Mutex::new(shell_service),
     };
 

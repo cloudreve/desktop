@@ -11,6 +11,7 @@ use crate::{
         sync::{cloud_file_to_metadata_entry, cloud_file_to_placeholder, is_symbolic_link},
     },
     inventory::{InventoryDb, MetadataEntry},
+    platform::windows::WindowsHydrationWriter,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -50,7 +51,7 @@ impl SyncFilter for CallbackHandler {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let command = MountCommand::FetchData {
             path: request.path().to_path_buf(),
-            ticket,
+            writer: Box::new(WindowsHydrationWriter(ticket)),
             range: info.required_file_range(),
             response: response_tx,
         };

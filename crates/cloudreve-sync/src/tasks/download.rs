@@ -26,8 +26,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[cfg(target_os = "windows")]
+use crate::cfapi::placeholder::LocalFileInfo;
+#[cfg(not(target_os = "windows"))]
+use crate::drive::placeholder::LocalFileInfo;
 use crate::{
-    cfapi::placeholder::LocalFileInfo,
     drive::{placeholder::CrPlaceholder, utils::local_path_to_cr_uri},
     inventory::{FileMetadata, InventoryDb},
     tasks::queue::QueuedTask,

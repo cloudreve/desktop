@@ -1,3 +1,4 @@
+#[cfg(target_os = "windows")]
 pub mod callback;
 pub mod commands;
 pub mod event_blocker;
