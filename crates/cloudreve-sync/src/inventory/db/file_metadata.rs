@@ -1,7 +1,5 @@
 use super::InventoryDb;
-use crate::inventory::{
-    ConflictState, FileMetadata, MetadataEntry,
-};
+use crate::inventory::{ConflictState, FileMetadata, MetadataEntry};
 use anyhow::{Context, Result};
 use diesel::prelude::*;
 use diesel::sql_types::Text;

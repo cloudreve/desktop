@@ -13,11 +13,7 @@ mod inner {
     use chrono::DateTime;
     use cloudreve_api::models::explorer::{FileResponse, file_type};
     use nt_time::FileTime;
-    use std::{
-        ffi::OsString,
-        path::PathBuf,
-        sync::Arc,
-    };
+    use std::{ffi::OsString, path::PathBuf, sync::Arc};
     use uuid::Uuid;
     use widestring::U16CString;
     use windows::{
@@ -27,11 +23,8 @@ mod inner {
             System::Variant::VT_UI4,
             UI::Shell::{
                 IShellItem2,
-                PropertiesSystem::{
-                    GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore,
-                },
-                SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR,
-                SHCreateItemFromParsingName,
+                PropertiesSystem::{GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore},
+                SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR, SHCreateItemFromParsingName,
             },
         },
         core::PCWSTR,
@@ -97,7 +90,8 @@ mod inner {
                     std::fs::remove_dir_all(&self.local_path)
                         .context("failed to delete local directory")?;
                 } else {
-                    std::fs::remove_file(&self.local_path).context("failed to delete local file")?;
+                    std::fs::remove_file(&self.local_path)
+                        .context("failed to delete local file")?;
                 }
             }
 
@@ -282,8 +276,9 @@ mod inner {
                 .context("failed to convert path to wide string")?;
 
             unsafe {
-                let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None)
-                    .context("failed to create shell item from path")?;
+                let item: IShellItem2 =
+                    SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None)
+                        .context("failed to create shell item from path")?;
 
                 let flags = GPS_READWRITE | GPS_EXTRINSICPROPERTIESONLY;
                 let property_store: IPropertyStore = item
@@ -332,11 +327,14 @@ mod inner {
 
     /// Non-Windows stub for local file information.
     /// Provides a compatible API surface with the Windows `LocalFileInfo` from cfapi.
+    /// On Linux, queries the FUSE InodeDb for placeholder/sync state.
     pub struct LocalFileInfo {
         pub exists: bool,
         pub is_directory: bool,
         pub file_size: Option<u64>,
         pub last_modified: Option<SystemTime>,
+        /// Whether tracked in the FUSE inode DB (Linux only).
+        inode_tracked: bool,
     }
 
     impl LocalFileInfo {
@@ -346,6 +344,7 @@ mod inner {
                 is_directory: false,
                 file_size: None,
                 last_modified: None,
+                inode_tracked: false,
             }
         }
 
@@ -354,30 +353,53 @@ mod inner {
                 return Ok(Self::missing());
             }
             let metadata = std::fs::metadata(path).context("failed to read file metadata")?;
-            Ok(Self {
+
+            let info = Self {
                 exists: true,
                 is_directory: metadata.is_dir(),
                 file_size: Some(metadata.len()),
                 last_modified: metadata.modified().ok(),
-            })
+                inode_tracked: false,
+            };
+
+            // On Linux, check if the file is tracked in the FUSE inode DB
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(inode_db) = crate::platform::linux::provider::global_inode_db() {
+                    let components: Vec<_> = path.components().collect();
+                    for start in 0..components.len() {
+                        let mut relative = std::path::PathBuf::from("/");
+                        for comp in &components[start..] {
+                            if let std::path::Component::Normal(name) = comp {
+                                relative.push(name);
+                            }
+                        }
+                        if inode_db.find_by_path(&relative).is_some() {
+                            return Ok(Self {
+                                inode_tracked: true,
+                                ..info
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(info)
         }
 
-        /// On non-Windows, files are never cloud placeholders.
         pub fn in_sync(&self) -> bool {
             false
         }
 
-        /// On non-Windows, files are never cloud placeholders.
         pub fn is_directory(&self) -> bool {
             self.is_directory
         }
 
-        /// On non-Windows, files are never cloud placeholders.
+        /// On Linux with FUSE, files tracked in InodeDb are placeholders.
         pub fn is_placeholder(&self) -> bool {
-            false
+            self.inode_tracked
         }
 
-        /// On non-Windows, files are never partial on disk.
         pub fn partial_on_disk(&self) -> bool {
             false
         }
@@ -401,8 +423,8 @@ mod inner {
     impl CrPlaceholder {
         pub fn new(local_path: impl Into<PathBuf>, sync_root: PathBuf, drive_id: Uuid) -> Self {
             let local_path = local_path.into();
-            let local_file_info = LocalFileInfo::from_path(&local_path)
-                .unwrap_or(LocalFileInfo::missing());
+            let local_file_info =
+                LocalFileInfo::from_path(&local_path).unwrap_or(LocalFileInfo::missing());
             let exists = local_file_info.exists;
             let is_dir = local_file_info.is_directory;
             Self {
@@ -438,7 +460,8 @@ mod inner {
                     std::fs::remove_dir_all(&self.local_path)
                         .context("failed to delete local directory")?;
                 } else {
-                    std::fs::remove_file(&self.local_path).context("failed to delete local file")?;
+                    std::fs::remove_file(&self.local_path)
+                        .context("failed to delete local file")?;
                 }
             }
 

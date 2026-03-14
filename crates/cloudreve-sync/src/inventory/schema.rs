@@ -68,3 +68,22 @@ diesel::table! {
         updated_at -> BigInt,
     }
 }
+
+diesel::table! {
+    fuse_inodes (inode) {
+        inode -> BigInt,
+        parent_inode -> BigInt,
+        name -> Text,
+        is_directory -> Bool,
+        size -> BigInt,
+        etag -> Text,
+        created_at -> BigInt,
+        modified_at -> BigInt,
+        accessed_at -> BigInt,
+        cache_state -> Text,
+        pinned -> Bool,
+        has_error -> Bool,
+        populated -> Bool,
+        drive_id -> Text,
+    }
+}

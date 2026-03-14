@@ -81,7 +81,7 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
     {
         let mut query = base.query_pairs_mut();
         query.append_pair("user_hint", config.user_id.as_str());
-         query.append_pair("path", "cloudreve://trash");
+        query.append_pair("path", "cloudreve://trash");
     }
 
     Ok(base.to_string())
@@ -89,7 +89,10 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
 
 /// Notify the shell to refresh the file or directory (Windows-only).
 #[cfg(target_os = "windows")]
-pub fn notify_shell_change(path: &PathBuf, event: windows::Win32::UI::Shell::SHCNE_ID) -> Result<()> {
+pub fn notify_shell_change(
+    path: &PathBuf,
+    event: windows::Win32::UI::Shell::SHCNE_ID,
+) -> Result<()> {
     use widestring::U16CString;
     use windows::Win32::UI::Shell::{SHCNF_PATHW, SHChangeNotify};
 

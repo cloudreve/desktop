@@ -322,8 +322,18 @@ impl<'a> DownloadTask<'a> {
         // Get download URL from server using inventory metadata for entity validation
         let mut request = FileURLService::default();
         request.uris.push(uri.clone());
-        if self.remote_file_info.as_ref().map(|f|f.primary_entity.is_some()).unwrap_or(false) {
-            request.entity = self.remote_file_info.as_ref().unwrap().primary_entity.clone();
+        if self
+            .remote_file_info
+            .as_ref()
+            .map(|f| f.primary_entity.is_some())
+            .unwrap_or(false)
+        {
+            request.entity = self
+                .remote_file_info
+                .as_ref()
+                .unwrap()
+                .primary_entity
+                .clone();
         }
 
         let entity_url_res = self

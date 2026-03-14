@@ -5,7 +5,7 @@ use std::ffi::OsString;
 pub struct FileMetadataPlatform {
     pub is_directory: bool,
     pub size: u64,
-    pub created_at: i64, // unix timestamp seconds
+    pub created_at: i64,  // unix timestamp seconds
     pub modified_at: i64, // unix timestamp seconds
 }
 

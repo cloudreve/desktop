@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 #[cfg(target_os = "windows")]
-use crate::cfapi::root::{SyncRootId, SyncRootIdBuilder, SecurityId};
+use crate::cfapi::root::{SecurityId, SyncRootId, SyncRootIdBuilder};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
@@ -340,8 +340,8 @@ impl Mount {
         // Platform-specific provider construction and startup
         #[cfg(target_os = "windows")]
         {
-            use crate::platform::windows::WindowsSyncProvider;
             use crate::drive::callback::CallbackHandler;
+            use crate::platform::windows::WindowsSyncProvider;
 
             if !WindowsSyncProvider::is_supported()
                 .map_err(|e| anyhow::anyhow!("Cloud Filter API is not supported: {}", e))?
@@ -370,18 +370,21 @@ impl Mount {
             let provider_config = build_provider_config(&config)?;
 
             let mut provider = WindowsSyncProvider::new();
-            provider.start(&provider_config)
+            provider
+                .start(&provider_config)
                 .map_err(|e| anyhow::anyhow!("failed to start sync provider: {}", e))?;
 
             tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
-            provider.connect(
-                &config.sync_path,
-                CallbackHandler::new(
-                    self.command_tx.clone(),
-                    self.id.clone(),
-                    self.inventory.clone(),
-                ),
-            ).context("failed to connect to sync root")?;
+            provider
+                .connect(
+                    &config.sync_path,
+                    CallbackHandler::new(
+                        self.command_tx.clone(),
+                        self.id.clone(),
+                        self.inventory.clone(),
+                    ),
+                )
+                .context("failed to connect to sync root")?;
 
             *self.provider.lock().await = Some(Box::new(provider));
         }
@@ -394,7 +397,10 @@ impl Mount {
             let provider_config = build_provider_config(&config)?;
 
             let mut provider = LinuxFuseProvider::new();
-            provider.start(&provider_config)
+            provider.set_command_tx(self.command_tx.clone());
+            provider.set_inventory(self.inventory.clone());
+            provider
+                .start(&provider_config)
                 .map_err(|e| anyhow::anyhow!("failed to start sync provider: {}", e))?;
 
             *self.provider.lock().await = Some(Box::new(provider));
@@ -402,9 +408,14 @@ impl Mount {
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
-            return Err(anyhow::anyhow!("Sync provider not supported on this platform"));
+            return Err(anyhow::anyhow!(
+                "Sync provider not supported on this platform"
+            ));
         }
 
+        // On Linux, FUSE callbacks handle all local changes — no FS watcher needed.
+        // Using a file watcher on a FUSE mount would observe our own events, causing loops.
+        #[cfg(not(target_os = "linux"))]
         self.start_fs_watcher().await?;
         Ok(())
     }
@@ -581,9 +592,11 @@ impl Mount {
 
         // Stop the provider and unregister
         if let Some(ref mut provider) = *self.provider.lock().await {
-            provider.stop()
+            provider
+                .stop()
                 .map_err(|e| anyhow::anyhow!("failed to stop provider: {}", e))?;
-            provider.unregister()
+            provider
+                .unregister()
                 .map_err(|e| anyhow::anyhow!("failed to unregister provider: {}", e))?;
         }
         *self.provider.lock().await = None;
@@ -719,7 +732,9 @@ fn build_provider_config(config: &DriveConfig) -> Result<ProviderConfig> {
     let provider_id = {
         #[cfg(target_os = "windows")]
         {
-            config.sync_root_id.as_ref()
+            config
+                .sync_root_id
+                .as_ref()
                 .map(|id| serde_json::to_value(id).ok())
                 .flatten()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -739,7 +754,8 @@ fn build_provider_config(config: &DriveConfig) -> Result<ProviderConfig> {
         instance_url: config.instance_url.clone(),
         user_id: config.user_id.clone(),
         remote_path: config.remote_path.clone(),
-        recycle_bin_uri: recycle_bin_url(config).unwrap_or_else(|_| "https://cloudreve.org".to_string()),
+        recycle_bin_uri: recycle_bin_url(config)
+            .unwrap_or_else(|_| "https://cloudreve.org".to_string()),
     })
 }
 

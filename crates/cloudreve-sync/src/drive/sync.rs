@@ -640,7 +640,7 @@ impl Mount {
                     aggregate_error.push(path.clone(), anyhow::Error::from(err));
                 }
             }
-            SyncAction::QueueDownload { path, remote:_ } => {
+            SyncAction::QueueDownload { path, remote: _ } => {
                 tracing::info!(
                     target: "drive::sync",
                     id = %self.id,
@@ -1400,11 +1400,14 @@ impl Mount {
 }
 
 /// Compatibility module providing `LocalFileInfo` and `PinState` stubs for non-Windows platforms.
+///
+/// On Linux with FUSE active, queries the InodeDb to determine placeholder/sync state.
+/// On other non-Windows platforms, falls back to treating files as regular (non-placeholder).
 #[cfg(not(target_os = "windows"))]
 pub(crate) mod compat {
+    use anyhow::Result;
     use std::path::Path;
     use std::time::SystemTime;
-    use anyhow::Result;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum PinState {
@@ -1413,15 +1416,22 @@ pub(crate) mod compat {
         Unspecified,
     }
 
-    /// Minimal LocalFileInfo for non-Windows platforms.
-    /// On non-Windows, there is no cfapi placeholder concept.
-    /// All files are treated as regular files (not placeholders).
+    /// LocalFileInfo for non-Windows platforms.
+    /// On Linux, queries the FUSE InodeDb to determine placeholder and sync state.
     #[derive(Debug, Clone)]
     pub struct LocalFileInfo {
         pub exists: bool,
         pub is_directory: bool,
         pub file_size: Option<u64>,
         pub last_modified: Option<SystemTime>,
+        /// Whether this file is tracked in the FUSE inode DB (acts as placeholder).
+        inode_tracked: bool,
+        /// Cache state from the inode DB.
+        inode_cache_state: Option<String>,
+        /// Whether directory children have been fetched.
+        inode_populated: bool,
+        /// Whether the file is pinned for offline availability.
+        inode_pinned: bool,
     }
 
     impl LocalFileInfo {
@@ -1431,43 +1441,113 @@ pub(crate) mod compat {
                 is_directory: false,
                 file_size: None,
                 last_modified: None,
+                inode_tracked: false,
+                inode_cache_state: None,
+                inode_populated: false,
+                inode_pinned: false,
             }
         }
 
         pub fn from_path(path: &Path) -> Result<Self> {
-            match std::fs::metadata(path) {
-                Ok(meta) => Ok(Self {
-                    exists: true,
-                    is_directory: meta.is_dir(),
-                    file_size: Some(meta.len()),
-                    last_modified: meta.modified().ok(),
-                }),
-                Err(_) => Ok(Self::missing()),
+            let fs_meta = std::fs::metadata(path).ok();
+            let exists = fs_meta.is_some();
+            let is_directory = fs_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let file_size = fs_meta.as_ref().map(|m| m.len());
+            let last_modified = fs_meta.and_then(|m| m.modified().ok());
+
+            // On Linux, query the FUSE InodeDb if it's available
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(inode_db) = crate::platform::linux::provider::global_inode_db() {
+                    // Try to find this path in the inode DB
+                    // We need to convert the absolute path to a FUSE-relative path
+                    // The inode DB stores paths relative to "/" (the mount root)
+                    // We check all path suffixes to find a match
+                    if let Some(entry) = Self::find_in_inode_db(path, inode_db) {
+                        return Ok(Self {
+                            exists: true,
+                            is_directory: entry.is_directory,
+                            file_size: Some(entry.size as u64),
+                            last_modified,
+                            inode_tracked: true,
+                            inode_cache_state: Some(entry.cache_state.as_str().to_string()),
+                            inode_populated: entry.populated,
+                            inode_pinned: entry.pinned,
+                        });
+                    }
+                }
             }
+
+            Ok(Self {
+                exists,
+                is_directory,
+                file_size,
+                last_modified,
+                inode_tracked: false,
+                inode_cache_state: None,
+                inode_populated: false,
+                inode_pinned: false,
+            })
         }
 
+        #[cfg(target_os = "linux")]
+        fn find_in_inode_db(
+            path: &Path,
+            inode_db: &crate::platform::linux::InodeDb,
+        ) -> Option<crate::platform::linux::inode::InodeEntry> {
+            // The InodeDb find_by_path expects paths relative to the mount root (starting with /).
+            // We need to try finding a matching suffix.
+            // The simplest approach: iterate path components from root and try each suffix.
+            let components: Vec<_> = path.components().collect();
+            for start in 0..components.len() {
+                let mut relative = std::path::PathBuf::from("/");
+                for comp in &components[start..] {
+                    if let std::path::Component::Normal(name) = comp {
+                        relative.push(name);
+                    }
+                }
+                if let Some(entry) = inode_db.find_by_path(&relative) {
+                    return Some(entry);
+                }
+            }
+            None
+        }
+
+        /// On Linux with FUSE, files tracked in InodeDb are considered placeholders.
         pub fn is_placeholder(&self) -> bool {
-            false
+            self.inode_tracked
         }
 
+        /// A file is in sync when it's tracked and fully cached (not dirty).
         pub fn in_sync(&self) -> bool {
-            false
+            self.inode_tracked && self.inode_cache_state.as_deref() == Some("cached")
         }
 
+        /// A file is partial on disk when tracked but not cached at all.
         pub fn partial_on_disk(&self) -> bool {
-            false
+            self.inode_tracked && self.inode_cache_state.as_deref() == Some("not_cached")
         }
 
         pub fn is_directory(&self) -> bool {
             self.is_directory
         }
 
+        /// A directory is "populated" if it's tracked and the populated flag is set,
+        /// or if it's an untracked directory that physically exists.
         pub fn is_folder_populated(&self) -> bool {
-            self.is_directory && self.exists
+            if self.inode_tracked {
+                self.inode_populated
+            } else {
+                self.is_directory && self.exists
+            }
         }
 
         pub fn pinned(&self) -> PinState {
-            PinState::Unspecified
+            if self.inode_pinned {
+                PinState::Pinned
+            } else {
+                PinState::Unspecified
+            }
         }
     }
 }

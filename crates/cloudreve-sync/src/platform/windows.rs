@@ -3,7 +3,9 @@ use std::path::Path;
 
 use crate::cfapi::filter::ticket;
 use crate::cfapi::metadata::Metadata;
-use crate::cfapi::placeholder::{ConvertOptions, LocalFileInfo, OpenOptions, UpdateOptions as CfapiUpdateOptions};
+use crate::cfapi::placeholder::{
+    ConvertOptions, LocalFileInfo, OpenOptions, UpdateOptions as CfapiUpdateOptions,
+};
 use crate::cfapi::placeholder_file::PlaceholderFile;
 use crate::cfapi::root::{
     Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder,
@@ -17,15 +19,16 @@ use nt_time::FileTime;
 use sha2::{Digest, Sha256};
 use url::Url;
 use widestring::U16CString;
+use windows::Storage::Provider::StorageProviderSyncRootManager;
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Storage::EnhancedStorage::PKEY_LastSyncError;
 use windows::Win32::System::Variant::VT_UI4;
 use windows::Win32::UI::Shell::{
-    IShellItem2, PropertiesSystem::{GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore},
-    SHCNE_ATTRIBUTES, SHCNE_DELETE,
-    SHCreateItemFromParsingName, SHCNE_ID, SHCNF_PATHW, SHChangeNotify,
+    IShellItem2,
+    PropertiesSystem::{GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore},
+    SHCNE_ATTRIBUTES, SHCNE_DELETE, SHCNE_ID, SHCNF_PATHW, SHChangeNotify,
+    SHCreateItemFromParsingName,
 };
-use windows::Storage::Provider::StorageProviderSyncRootManager;
 use windows::core::{HSTRING, PCWSTR};
 use windows_core::PROPVARIANT;
 
@@ -54,11 +57,7 @@ impl WindowsSyncProvider {
             // Reconstruct SyncRootId from its serialized string form (same as Deserialize impl)
             Ok(SyncRootId(HSTRING::from(&config.provider_id)))
         } else {
-            generate_sync_root_id(
-                &config.instance_url,
-                &config.user_id,
-                &config.sync_path,
-            )
+            generate_sync_root_id(&config.instance_url, &config.user_id, &config.sync_path)
         }
     }
 
@@ -69,11 +68,7 @@ impl WindowsSyncProvider {
 
     /// Connect to an already-registered sync root with a callback handler.
     /// This is called by `Mount::start()` to establish the cfapi connection.
-    pub fn connect(
-        &mut self,
-        sync_path: &Path,
-        handler: CallbackHandler,
-    ) -> anyhow::Result<()> {
+    pub fn connect(&mut self, sync_path: &Path, handler: CallbackHandler) -> anyhow::Result<()> {
         let connection = Session::new()
             .connect(sync_path, handler)
             .context("failed to connect to sync root")?;
@@ -88,7 +83,8 @@ impl SyncProvider for WindowsSyncProvider {
             .map_err(|e| PlatformError::Failed(format!("failed to resolve sync root id: {}", e)))?;
 
         // Register sync root if not already registered
-        let is_registered = sync_root_id.is_registered()
+        let is_registered = sync_root_id
+            .is_registered()
             .map_err(|e| PlatformError::Failed(format!("failed to check registration: {}", e)))?;
 
         if !is_registered {
@@ -102,17 +98,21 @@ impl SyncProvider for WindowsSyncProvider {
             sync_root_info.set_version("1.0.0");
             sync_root_info
                 .set_recycle_bin_uri(&config.recycle_bin_uri)
-                .map_err(|e| PlatformError::Failed(format!("failed to set recycle bin uri: {}", e)))?;
+                .map_err(|e| {
+                    PlatformError::Failed(format!("failed to set recycle bin uri: {}", e))
+                })?;
+            sync_root_info.set_path(&config.sync_path).map_err(|e| {
+                PlatformError::Failed(format!("failed to set sync root path: {}", e))
+            })?;
             sync_root_info
-                .set_path(&config.sync_path)
-                .map_err(|e| PlatformError::Failed(format!("failed to set sync root path: {}", e)))?;
-            sync_root_info.add_custom_state(t!("shared").as_ref(), 1)
+                .add_custom_state(t!("shared").as_ref(), 1)
                 .map_err(|e| PlatformError::Failed(format!("failed to add custom state: {}", e)))?;
-            sync_root_info.add_custom_state(t!("accessible").as_ref(), 2)
+            sync_root_info
+                .add_custom_state(t!("accessible").as_ref(), 2)
                 .map_err(|e| PlatformError::Failed(format!("failed to add custom state: {}", e)))?;
-            sync_root_id
-                .register(sync_root_info)
-                .map_err(|e| PlatformError::Failed(format!("failed to register sync root: {}", e)))?;
+            sync_root_id.register(sync_root_info).map_err(|e| {
+                PlatformError::Failed(format!("failed to register sync root: {}", e))
+            })?;
         }
 
         // Add to search indexer
@@ -126,7 +126,8 @@ impl SyncProvider for WindowsSyncProvider {
 
     fn stop(&mut self) -> PlatformResult<()> {
         if let Some(ref connection) = self.connection {
-            connection.disconnect()
+            connection
+                .disconnect()
                 .map_err(|e| PlatformError::Failed(format!("failed to disconnect: {}", e)))?;
         }
         self.connection = None;
@@ -135,8 +136,9 @@ impl SyncProvider for WindowsSyncProvider {
 
     fn unregister(&mut self) -> PlatformResult<()> {
         if let Some(ref sync_root_id) = self.sync_root_id {
-            sync_root_id.unregister()
-                .map_err(|e| PlatformError::Failed(format!("failed to unregister sync root: {}", e)))?;
+            sync_root_id.unregister().map_err(|e| {
+                PlatformError::Failed(format!("failed to unregister sync root: {}", e))
+            })?;
         }
         self.sync_root_id = None;
         Ok(())
@@ -161,8 +163,9 @@ impl SyncProvider for WindowsSyncProvider {
 
         // PlaceholderFile::create takes self by value
         for placeholder in placeholders {
-            placeholder.create::<&Path>(parent)
-                .map_err(|e| PlatformError::Failed(format!("failed to create placeholder: {}", e)))?;
+            placeholder.create::<&Path>(parent).map_err(|e| {
+                PlatformError::Failed(format!("failed to create placeholder: {}", e))
+            })?;
         }
 
         Ok(())
@@ -195,7 +198,9 @@ impl SyncProvider for WindowsSyncProvider {
                 .write_access()
                 .exclusive()
                 .open(path)
-                .map_err(|e| PlatformError::Failed(format!("failed to open for dehydration: {}", e)))?
+                .map_err(|e| {
+                    PlatformError::Failed(format!("failed to open for dehydration: {}", e))
+                })?
         } else {
             match is_dir {
                 true => OpenOptions::new().open(path),
@@ -226,11 +231,10 @@ impl SyncProvider for WindowsSyncProvider {
         .map_err(|e| PlatformError::Failed(format!("failed to open for conversion: {}", e)))?;
 
         handle
-            .convert_to_placeholder(
-                ConvertOptions::default().mark_in_sync().blob(blob),
-                None,
-            )
-            .map_err(|e| PlatformError::Failed(format!("failed to convert to placeholder: {}", e)))?;
+            .convert_to_placeholder(ConvertOptions::default().mark_in_sync().blob(blob), None)
+            .map_err(|e| {
+                PlatformError::Failed(format!("failed to convert to placeholder: {}", e))
+            })?;
 
         Ok(())
     }
@@ -238,7 +242,8 @@ impl SyncProvider for WindowsSyncProvider {
     fn create_placeholder(&self, parent: &Path, entry: &PlaceholderEntry) -> PlatformResult<()> {
         let placeholder = entry_to_cfapi_placeholder(entry)?;
         // PlaceholderFile::create takes self by value
-        placeholder.create::<&Path>(parent)
+        placeholder
+            .create::<&Path>(parent)
             .map_err(|e| PlatformError::Failed(format!("failed to create placeholder: {}", e)))?;
         Ok(())
     }
@@ -272,12 +277,14 @@ impl SyncProvider for WindowsSyncProvider {
 
         unsafe {
             let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None)
-                .map_err(|e| PlatformError::Failed(format!("failed to create shell item: {}", e)))?;
+                .map_err(|e| {
+                PlatformError::Failed(format!("failed to create shell item: {}", e))
+            })?;
 
             let flags = GPS_READWRITE | GPS_EXTRINSICPROPERTIESONLY;
-            let property_store: IPropertyStore = item
-                .GetPropertyStore(flags)
-                .map_err(|e| PlatformError::Failed(format!("failed to get property store: {}", e)))?;
+            let property_store: IPropertyStore = item.GetPropertyStore(flags).map_err(|e| {
+                PlatformError::Failed(format!("failed to get property store: {}", e))
+            })?;
 
             let prop_var = if has_error {
                 let mut pv = PROPVARIANT::default().as_raw().clone();
@@ -291,11 +298,13 @@ impl SyncProvider for WindowsSyncProvider {
 
             property_store
                 .SetValue(&PKEY_LastSyncError, &prop_var)
-                .map_err(|e| PlatformError::Failed(format!("failed to set error property: {}", e)))?;
+                .map_err(|e| {
+                    PlatformError::Failed(format!("failed to set error property: {}", e))
+                })?;
 
-            property_store
-                .Commit()
-                .map_err(|e| PlatformError::Failed(format!("failed to commit property store: {}", e)))?;
+            property_store.Commit().map_err(|e| {
+                PlatformError::Failed(format!("failed to commit property store: {}", e))
+            })?;
         }
 
         Ok(())
@@ -318,12 +327,14 @@ pub struct WindowsHydrationWriter(pub ticket::FetchData);
 
 impl HydrationWriter for WindowsHydrationWriter {
     fn write_at(&self, buf: &[u8], offset: u64) -> anyhow::Result<()> {
-        self.0.write_at(buf, offset)
+        self.0
+            .write_at(buf, offset)
             .map_err(|e| anyhow::anyhow!("cfapi write_at failed: {:?}", e))
     }
 
     fn report_progress(&self, total: u64, completed: u64) -> anyhow::Result<()> {
-        self.0.report_progress(total, completed)
+        self.0
+            .report_progress(total, completed)
             .map_err(|e| anyhow::anyhow!("cfapi report_progress failed: {:?}", e))
     }
 }

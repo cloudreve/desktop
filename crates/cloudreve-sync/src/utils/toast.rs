@@ -66,10 +66,15 @@ mod inner {
             )
             .visual(
                 Image::create(3, "ms-appx:///Images/warning.svg")
-                    .with_placement(Placement::AppLogoOverride)
+                    .with_placement(Placement::AppLogoOverride),
             )
             .with_launch("action=settings")
-            .build(0, &notifier, &format!("token_expiry_{}", drive_id), "token_expiry")
+            .build(
+                0,
+                &notifier,
+                &format!("token_expiry_{}", drive_id),
+                "token_expiry",
+            )
             .unwrap();
 
         notif.show().unwrap();
@@ -96,10 +101,16 @@ mod inner {
                     .with_style(HintStyle::Title),
             )
             .visual(
-                Text::create(2, path.file_name().unwrap_or_default().to_str().unwrap_or_default())
-                    .with_align_center(true)
-                    .with_wrap(true)
-                    .with_style(HintStyle::Body),
+                Text::create(
+                    2,
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_str()
+                        .unwrap_or_default(),
+                )
+                .with_align_center(true)
+                .with_wrap(true)
+                .with_style(HintStyle::Body),
             )
             .actions(vec![
                 Box::new(Input::create_selection_input(
@@ -117,13 +128,20 @@ mod inner {
                     ActionButton::create(t!("resolveWithAction").as_ref())
                         .with_id(&format!(
                             "action=resolve&drive_id={}&file_id={}&path={}",
-                            drive_id, inventory_id, URL_SAFE.encode(path.display().to_string())
+                            drive_id,
+                            inventory_id,
+                            URL_SAFE.encode(path.display().to_string())
                         ))
                         .with_tooltip(t!("resolveTooltip").as_ref()),
                 ),
                 Box::new(ActionButton::create(t!("dismiss").as_ref()).with_id("action=dismiss")),
             ])
-            .build(0, &notifier, &format!("conflict_{}", inventory_id), "readme")
+            .build(
+                0,
+                &notifier,
+                &format!("conflict_{}", inventory_id),
+                "readme",
+            )
             .unwrap();
 
         notif.show().unwrap();

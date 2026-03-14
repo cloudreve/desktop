@@ -14,7 +14,9 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use config::{AppConfig, ConfigManager};
-pub use drive::manager::{DriveInfo, DriveInfoStatus, DriveManager, StatusSummary, TaskWithProgress};
+pub use drive::manager::{
+    DriveInfo, DriveInfoStatus, DriveManager, StatusSummary, TaskWithProgress,
+};
 pub use drive::mounts::{Credentials, DriveConfig};
 pub use events::{Event, EventBroadcaster};
 pub use logging::{LogConfig, LogGuard};

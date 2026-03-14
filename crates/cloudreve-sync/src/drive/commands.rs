@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use crate::cfapi::placeholder::{LocalFileInfo, OpenOptions, PinState};
 use crate::{
     drive::{
         mounts::Mount,
@@ -10,8 +12,6 @@ use crate::{
     tasks::TaskPayload,
     utils::toast,
 };
-#[cfg(target_os = "windows")]
-use crate::cfapi::placeholder::{LocalFileInfo, OpenOptions, PinState};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use cloudreve_api::{
@@ -129,28 +129,38 @@ unsafe impl Send for MountCommand {}
 impl std::fmt::Debug for MountCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MountCommand::FetchPlaceholders { path, .. } => {
-                f.debug_struct("FetchPlaceholders").field("path", path).finish()
-            }
+            MountCommand::FetchPlaceholders { path, .. } => f
+                .debug_struct("FetchPlaceholders")
+                .field("path", path)
+                .finish(),
             MountCommand::RefreshCredentials { .. } => {
                 f.debug_struct("RefreshCredentials").finish()
             }
             MountCommand::CredentialInvalid => write!(f, "CredentialInvalid"),
-            MountCommand::FetchData { path, range, .. } => {
-                f.debug_struct("FetchData").field("path", path).field("range", range).finish()
-            }
-            MountCommand::ProcessFsEvents { .. } => {
-                f.debug_struct("ProcessFsEvents").finish()
-            }
-            MountCommand::Sync { local_paths, mode } => {
-                f.debug_struct("Sync").field("local_paths", local_paths).field("mode", mode).finish()
-            }
-            MountCommand::Rename { source, target, .. } => {
-                f.debug_struct("Rename").field("source", source).field("target", target).finish()
-            }
-            MountCommand::Renamed { source, destination } => {
-                f.debug_struct("Renamed").field("source", source).field("destination", destination).finish()
-            }
+            MountCommand::FetchData { path, range, .. } => f
+                .debug_struct("FetchData")
+                .field("path", path)
+                .field("range", range)
+                .finish(),
+            MountCommand::ProcessFsEvents { .. } => f.debug_struct("ProcessFsEvents").finish(),
+            MountCommand::Sync { local_paths, mode } => f
+                .debug_struct("Sync")
+                .field("local_paths", local_paths)
+                .field("mode", mode)
+                .finish(),
+            MountCommand::Rename { source, target, .. } => f
+                .debug_struct("Rename")
+                .field("source", source)
+                .field("target", target)
+                .finish(),
+            MountCommand::Renamed {
+                source,
+                destination,
+            } => f
+                .debug_struct("Renamed")
+                .field("source", source)
+                .field("destination", destination)
+                .finish(),
         }
     }
 }
@@ -303,26 +313,30 @@ impl Mount {
                 let aligned_size = (accumulator.len() / CHUNK_SIZE) * CHUNK_SIZE;
                 let write_data = accumulator.drain(..aligned_size).collect::<Vec<u8>>();
 
-                writer.write_at(&write_data, current_offset)
+                writer
+                    .write_at(&write_data, current_offset)
                     .context("failed to write data")?;
 
                 bytes_transferred += write_data.len() as u64;
                 current_offset += write_data.len() as u64;
 
-                writer.report_progress(total_bytes, bytes_transferred)
+                writer
+                    .report_progress(total_bytes, bytes_transferred)
                     .context("failed to report progress")?;
             }
         }
 
         // Write any remaining data (last chunk, may be less than 4KB)
         if !accumulator.is_empty() {
-            writer.write_at(&accumulator, current_offset)
+            writer
+                .write_at(&accumulator, current_offset)
                 .context("failed to write remaining data")?;
 
             bytes_transferred += accumulator.len() as u64;
             // current_offset += accumulator.len() as u64;
 
-            writer.report_progress(total_bytes, bytes_transferred)
+            writer
+                .report_progress(total_bytes, bytes_transferred)
                 .context("failed to report final progress")?;
         }
 
@@ -900,7 +914,10 @@ impl Mount {
                     match placeholder.dehydrate(0..) {
                         Ok(_) => {
                             tracing::trace!(target: "drive::commands", path = %path.display(), "Dehydration complete");
-                            _ = notify_shell_change(&path, windows::Win32::UI::Shell::SHCNE_ATTRIBUTES);
+                            _ = notify_shell_change(
+                                &path,
+                                windows::Win32::UI::Shell::SHCNE_ATTRIBUTES,
+                            );
                         }
                         Err(e) => {
                             tracing::error!(
