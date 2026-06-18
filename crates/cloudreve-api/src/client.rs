@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const API_PREFIX: &str = "/api/v4";
 pub const CR_HEADER_PREFIX: &str = "X-Cr-";
@@ -143,6 +143,7 @@ pub struct Client {
     pub(crate) config: ClientConfig,
     pub(crate) http_client: HttpClient,
     pub(crate) tokens: Arc<RwLock<TokenStore>>,
+    refresh_lock: Arc<Mutex<()>>,
     pub(crate) purchase_ticket: Arc<RwLock<Option<String>>>,
     on_credential_refreshed: Option<OnCredentialRefreshed>,
     on_credential_invalid: Option<OnCredentialInvalid>,
@@ -152,8 +153,7 @@ impl Client {
     /// Create a new API client
     pub fn new(config: ClientConfig) -> Self {
         let mut builder = HttpClient::builder()
-            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds))
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds));
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds));
 
         if let Some(ref user_agent) = config.user_agent {
             builder = builder.user_agent(user_agent);
@@ -165,6 +165,7 @@ impl Client {
             config,
             http_client,
             tokens: Arc::new(RwLock::new(TokenStore::new())),
+            refresh_lock: Arc::new(Mutex::new(())),
             purchase_ticket: Arc::new(RwLock::new(None)),
             on_credential_refreshed: None,
             on_credential_invalid: None,
@@ -352,8 +353,25 @@ impl Client {
     /// `/session/oauth/token` only supports `authorization_code` grant and is
     /// not used here.
     async fn refresh_access_token(&self) -> ApiResult<String> {
+        let _guard = self.refresh_lock.lock().await;
+
         let refresh_token = {
             let store = self.tokens.read().await;
+
+            if !store.has_tokens() {
+                self.notify_credential_invalid().await;
+                return Err(ApiError::NoTokensAvailable);
+            }
+
+            if store.is_refresh_token_expired() {
+                self.notify_credential_invalid().await;
+                return Err(ApiError::RefreshTokenExpired);
+            }
+
+            if !store.is_access_token_expired() {
+                return Ok(store.access_token.clone().unwrap());
+            }
+
             store
                 .refresh_token
                 .clone()
@@ -364,7 +382,13 @@ impl Client {
         let url = self.build_url("/session/token/refresh");
         let request = RefreshTokenRequest { refresh_token };
 
-        let response = self.http_client.post(&url).json(&request).send().await?;
+        let response = self
+            .http_client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(self.config.timeout_seconds))
+            .json(&request)
+            .send()
+            .await?;
 
         let api_response: ApiResponse<Token> = response.json().await?;
 
@@ -410,7 +434,10 @@ impl Client {
         R: DeserializeOwned + Default,
     {
         let url = self.build_url(path);
-        let mut request = self.http_client.request(method, &url);
+        let mut request = self
+            .http_client
+            .request(method, &url)
+            .timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
 
         // Add authentication header if needed
         if !options.no_credential {
