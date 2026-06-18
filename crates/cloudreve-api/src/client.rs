@@ -344,7 +344,7 @@ impl Client {
         // Access token expired, need to refresh
         drop(store); // Release read lock before calling refresh
 
-        self.refresh_access_token().await
+        self.refresh_access_token(false).await
     }
 
     /// Refresh the access token using the refresh token.
@@ -352,7 +352,7 @@ impl Client {
     /// including tokens originally obtained via OAuth. The OAuth token endpoint
     /// `/session/oauth/token` only supports `authorization_code` grant and is
     /// not used here.
-    async fn refresh_access_token(&self) -> ApiResult<String> {
+    async fn refresh_access_token(&self, force: bool) -> ApiResult<String> {
         let _guard = self.refresh_lock.lock().await;
 
         let refresh_token = {
@@ -368,7 +368,7 @@ impl Client {
                 return Err(ApiError::RefreshTokenExpired);
             }
 
-            if !store.is_access_token_expired() {
+            if !force && !store.is_access_token_expired() {
                 return Ok(store.access_token.clone().unwrap());
             }
 
@@ -496,12 +496,6 @@ impl Client {
 
         // Check response code
         if api_response.code != ErrorCode::Success as i32 {
-            // Check if this is a credential error and invoke callback
-            if let Some(error_code) = ErrorCode::from_code(api_response.code) {
-                if error_code.is_credential_error() {
-                    self.notify_credential_invalid().await;
-                }
-            }
             return Err(ApiError::from_response(api_response));
         }
 
@@ -526,9 +520,10 @@ impl Client {
             .await
         {
             Ok(result) => Ok(result),
-            Err(ApiError::AccessTokenExpired) => {
-                // Token expired, refresh and retry
-                self.refresh_access_token().await?;
+            Err(e) if e.is_token_expired() || e.requires_login() => {
+                // Server-side token state can be ahead of the local expiry timestamp.
+                // Force a refresh once before treating the credentials as invalid.
+                self.refresh_access_token(true).await?;
                 self.send_internal(path, method, body, options).await
             }
             Err(e) => Err(e),
