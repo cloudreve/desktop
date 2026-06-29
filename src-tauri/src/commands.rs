@@ -531,6 +531,8 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        crate::update_dock_visibility(app);
         return;
     }
 
@@ -562,6 +564,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
         Ok(window) => {
             // Set up close request handler for fast popup launch
             let window_clone = window.clone();
+            let app_handle = app.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     // Check if fast popup launch is enabled
@@ -571,11 +574,20 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                         let _ = window_clone.hide();
                     }
                 }
+                #[cfg(target_os = "macos")]
+                if matches!(
+                    event,
+                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                ) {
+                    crate::update_dock_visibility(&app_handle);
+                }
             });
 
             move_window_safely(&window, position, "main_popup");
             let _ = window.show();
             let _ = window.set_focus();
+            #[cfg(target_os = "macos")]
+            crate::update_dock_visibility(app);
         }
         Err(e) => {
             tracing::error!(target: "main_popup", error = %e, "Failed to create main window");
@@ -643,6 +655,8 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        crate::update_dock_visibility(app);
         return;
     }
 
@@ -685,11 +699,28 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
                 let _ = window.set_transparent(true);
                 let _ = window.set_effects(effects);
             }
+
+            #[cfg(target_os = "macos")]
+            {
+                let app_handle = app.clone();
+                window.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::CloseRequested { .. }
+                            | tauri::WindowEvent::Destroyed
+                    ) {
+                        crate::update_dock_visibility(&app_handle);
+                    }
+                });
+            }
+
             move_window_safely(&window, Position::Center, "add-drive");
             #[cfg(windows)]
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
+            #[cfg(target_os = "macos")]
+            crate::update_dock_visibility(app);
         }
         Err(e) => {
             tracing::error!(target: "main", error = %e, "Failed to create window: {}", title);
@@ -711,6 +742,8 @@ pub fn show_settings_window_impl(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        crate::update_dock_visibility(app);
         return;
     }
 
@@ -749,11 +782,28 @@ pub fn show_settings_window_impl(app: &AppHandle) {
                 let _ = window.set_transparent(true);
                 let _ = window.set_effects(effects);
             }
+
+            #[cfg(target_os = "macos")]
+            {
+                let app_handle = app.clone();
+                window.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::CloseRequested { .. }
+                            | tauri::WindowEvent::Destroyed
+                    ) {
+                        crate::update_dock_visibility(&app_handle);
+                    }
+                });
+            }
+
             move_window_safely(&window, Position::Center, "settings");
             #[cfg(windows)]
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
+            #[cfg(target_os = "macos")]
+            crate::update_dock_visibility(app);
         }
         Err(e) => {
             tracing::error!(target: "main", error = %e, "Failed to create settings window");
@@ -900,6 +950,8 @@ fn macos_launch_agent_entry() -> CommandResult<String> {
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
 </dict>
 </plist>
 "#,
@@ -910,11 +962,16 @@ fn macos_launch_agent_entry() -> CommandResult<String> {
 #[cfg(target_os = "macos")]
 fn macos_get_auto_start_enabled() -> CommandResult<bool> {
     let path = macos_launch_agent_path()?;
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(content.contains(MACOS_LAUNCH_AGENT_LABEL)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("Failed to read LaunchAgent: {}", err)),
-    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("Failed to read LaunchAgent: {}", err)),
+    };
+
+    // Verify the plist is ours and configured to start at login.
+    let has_label = content.contains(&format!("<string>{}</string>", MACOS_LAUNCH_AGENT_LABEL));
+    let run_at_load = content.contains("<key>RunAtLoad</key>") && content.contains("<true/>");
+    Ok(has_label && run_at_load)
 }
 
 #[cfg(target_os = "macos")]
@@ -929,8 +986,21 @@ fn macos_set_auto_start(enabled: bool) -> CommandResult<bool> {
             .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
         std::fs::write(&path, macos_launch_agent_entry()?)
             .map_err(|e| format!("Failed to write LaunchAgent: {}", e))?;
+
+        // Load the agent so it applies to the current session and is enabled
+        // for future logins. Ignore errors: launchctl may fail if the agent is
+        // already loaded, which still leaves the plist in place for next boot.
+        let path_str = path.display().to_string();
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["load", "-w", &path_str])
+            .output();
+
         Ok(true)
     } else {
+        // Only remove the plist. We intentionally do not `launchctl unload`
+        // because if the current process was launched by this agent, unload
+        // would terminate the running app. The agent will not be started on
+        // the next login since the plist is gone.
         match std::fs::remove_file(&path) {
             Ok(_) => Ok(false),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),

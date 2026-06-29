@@ -141,6 +141,24 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
 /// Marker struct for Tauri state that provides access to APP_STATE
 pub struct AppStateHandle;
 
+/// Update macOS Dock visibility based on whether any webview window is visible.
+#[cfg(target_os = "macos")]
+pub fn update_dock_visibility(app: &AppHandle) {
+    let has_visible = app
+        .webview_windows()
+        .values()
+        .any(|w| w.is_visible().unwrap_or(false));
+
+    if let Err(err) = app.set_dock_visibility(has_visible) {
+        tracing::warn!(
+            target: "main",
+            error = %err,
+            visible = has_visible,
+            "Failed to update Dock visibility"
+        );
+    }
+}
+
 impl AppStateHandle {
     pub fn get(&self) -> Option<&'static AppState> {
         APP_STATE.get()
@@ -317,6 +335,10 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.destroy();
             }
+
+            // Keep the Dock icon hidden on macOS while no window is visible.
+            #[cfg(target_os = "macos")]
+            update_dock_visibility(app.handle());
 
             Ok(())
         })
