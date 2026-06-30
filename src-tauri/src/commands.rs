@@ -564,7 +564,6 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
         Ok(window) => {
             // Set up close request handler for fast popup launch
             let window_clone = window.clone();
-            let app_handle = app.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     // Check if fast popup launch is enabled
@@ -573,13 +572,6 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                         api.prevent_close();
                         let _ = window_clone.hide();
                     }
-                }
-                #[cfg(target_os = "macos")]
-                if matches!(
-                    event,
-                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-                ) {
-                    crate::update_dock_visibility(&app_handle);
                 }
             });
 
@@ -700,20 +692,6 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
                 let _ = window.set_effects(effects);
             }
 
-            #[cfg(target_os = "macos")]
-            {
-                let app_handle = app.clone();
-                window.on_window_event(move |event| {
-                    if matches!(
-                        event,
-                        tauri::WindowEvent::CloseRequested { .. }
-                            | tauri::WindowEvent::Destroyed
-                    ) {
-                        crate::update_dock_visibility(&app_handle);
-                    }
-                });
-            }
-
             move_window_safely(&window, Position::Center, "add-drive");
             #[cfg(windows)]
             let _ = window.create_overlay_titlebar();
@@ -781,20 +759,6 @@ pub fn show_settings_window_impl(app: &AppHandle) {
             {
                 let _ = window.set_transparent(true);
                 let _ = window.set_effects(effects);
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let app_handle = app.clone();
-                window.on_window_event(move |event| {
-                    if matches!(
-                        event,
-                        tauri::WindowEvent::CloseRequested { .. }
-                            | tauri::WindowEvent::Destroyed
-                    ) {
-                        crate::update_dock_visibility(&app_handle);
-                    }
-                });
             }
 
             move_window_safely(&window, Position::Center, "settings");

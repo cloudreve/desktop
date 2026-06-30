@@ -373,7 +373,7 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             match event {
                 RunEvent::ExitRequested { api,code,.. } => {
                      if code.is_none() {
@@ -386,6 +386,21 @@ pub fn run() {
                 RunEvent::Exit => {
                     // Perform shutdown when the app is actually exiting
                     tauri::async_runtime::block_on(shutdown());
+                }
+                #[cfg(target_os = "macos")]
+                RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::CloseRequested { .. }
+                        | tauri::WindowEvent::Destroyed,
+                    ..
+                } => {
+                    // Re-evaluate Dock visibility shortly after a window is
+                    // closed or destroyed so webview_windows() reflects the
+                    // change and the Dock icon hides when no window remains.
+                    let app_handle = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        update_dock_visibility(&app_handle);
+                    });
                 }
                 _ => {}
             }
