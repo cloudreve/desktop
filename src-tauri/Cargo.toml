@@ -55,3 +55,6 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-positioner = { version = "2.3.2", features = ["tray-icon"] }
+
+[dev-dependencies]
+serial_test = "3"

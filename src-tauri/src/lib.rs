@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{
     async_runtime::spawn,
     menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Listener, Manager, RunEvent,
 };
 #[cfg(not(target_os = "macos"))]
@@ -21,7 +21,53 @@ mod event_handler;
 #[macro_use]
 extern crate rust_i18n;
 
-i18n!("../locales");
+i18n!("../locales", fallback = "en-US");
+
+/// Normalize a raw locale string to one supported by the app.
+///
+/// macOS may report locales like "zh-Hans-CN" which don't directly match our
+/// translation files ("zh-CN"). This strips script tags and falls back to the
+/// language code before giving up and returning "en-US".
+fn normalize_locale(locale: &str) -> String {
+    let locale = locale.trim();
+    if locale.is_empty() {
+        return "en-US".to_string();
+    }
+
+    let available = available_locales!();
+    let lower = locale.to_lowercase();
+
+    // Exact match (case-insensitive)
+    for l in &available {
+        if l.to_lowercase() == lower {
+            return l.to_string();
+        }
+    }
+
+    // Try to strip script subtag: zh-Hans-CN -> zh-CN
+    let parts: Vec<&str> = locale.split('-').collect();
+    if parts.len() >= 3 {
+        let without_script = format!("{}-{}", parts[0], parts.last().unwrap());
+        let lower_without = without_script.to_lowercase();
+        for l in &available {
+            if l.to_lowercase() == lower_without {
+                return l.to_string();
+            }
+        }
+    }
+
+    // Try language code only: en-US -> en
+    if !parts.is_empty() {
+        let lang = parts[0].to_lowercase();
+        for l in &available {
+            if l.to_lowercase() == lang {
+                return l.to_string();
+            }
+        }
+    }
+
+    "en-US".to_string()
+}
 
 /// Initialize i18n based on config setting or system locale
 fn init_i18n() {
@@ -32,16 +78,17 @@ fn init_i18n() {
     let locale = ConfigManager::try_get()
         .and_then(|cm| cm.language())
         .unwrap_or_else(|| get_locale().unwrap_or_else(|| String::from("en-US")));
-    set_locale(locale.as_str());
+    set_locale(normalize_locale(&locale).as_str());
 }
 
 /// Get the current effective locale (from config or system)
 pub fn get_effective_locale() -> String {
     use sys_locale::get_locale;
 
-    ConfigManager::try_get()
+    let locale = ConfigManager::try_get()
         .and_then(|cm| cm.language())
-        .unwrap_or_else(|| get_locale().unwrap_or_else(|| String::from("en-US")))
+        .unwrap_or_else(|| get_locale().unwrap_or_else(|| String::from("en-US")));
+    normalize_locale(&locale)
 }
 
 /// Application state containing the drive manager and event broadcaster
@@ -214,24 +261,47 @@ async fn shutdown() {
     tracing::info!(target: "main", "Shutdown complete");
 }
 
+/// Return the tray menu item IDs and their localized titles.
+fn tray_menu_entries() -> [(&'static str, String); 4] {
+    [
+        ("show", t!("show").to_string()),
+        ("add_drive", t!("addNewDrive").to_string()),
+        ("settings", t!("settings").to_string()),
+        ("quit", t!("quit").to_string()),
+    ]
+}
+
+/// Build the localized tray context menu with the current locale.
+fn build_tray_menu<R: tauri::Runtime>(
+    manager: &impl Manager<R>,
+) -> anyhow::Result<Menu<R>> {
+    let entries = tray_menu_entries();
+    let menu_items: Vec<MenuItem<R>> = entries
+        .iter()
+        .map(|(id, title)| MenuItem::with_id(manager, *id, title.clone(), true, None::<&str>))
+        .collect::<Result<_, _>>()?;
+    let item_refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = menu_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<R>)
+        .collect();
+    let menu = Menu::with_items(manager, &item_refs)?;
+    Ok(menu)
+}
+
+/// Rebuild the tray context menu using the current locale.
+pub fn rebuild_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> anyhow::Result<()> {
+    let menu = build_tray_menu(app)?;
+    let tray = app.state::<TrayIcon<R>>();
+    tray.set_menu(Some(menu))?;
+    Ok(())
+}
+
 /// Setup the system tray icon
 fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
-    // Create menu items
-    let show_i = MenuItem::with_id(app, "show", t!("show").as_ref(), true, None::<&str>)?;
-    let add_drive_i = MenuItem::with_id(
-        app,
-        "add_drive",
-        t!("addNewDrive").as_ref(),
-        true,
-        None::<&str>,
-    )?;
-    let settings_i =
-        MenuItem::with_id(app, "settings", t!("settings").as_ref(), true, None::<&str>)?;
-    let quit_i = MenuItem::with_id(app, "quit", t!("quit").as_ref(), true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &add_drive_i, &settings_i, &quit_i])?;
+    let menu = build_tray_menu(app)?;
 
     // Build tray icon
-    TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -263,6 +333,10 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             }
         })
         .build(app)?;
+
+    // Keep the tray icon in Tauri's managed state so we can update its menu
+    // when the language changes.
+    app.manage(tray);
 
     Ok(())
 }
@@ -389,12 +463,14 @@ pub fn run() {
                 }
                 #[cfg(target_os = "macos")]
                 RunEvent::WindowEvent {
-                    event: tauri::WindowEvent::CloseRequested { .. }
-                        | tauri::WindowEvent::Destroyed,
+                    event:
+                        tauri::WindowEvent::CloseRequested { .. }
+                        | tauri::WindowEvent::Destroyed
+                        | tauri::WindowEvent::Focused(false),
                     ..
                 } => {
-                    // Re-evaluate Dock visibility shortly after a window is
-                    // closed or destroyed so webview_windows() reflects the
+                    // Re-evaluate Dock visibility shortly after a window loses focus
+                    // or is closed/destroyed, so webview_windows() reflects the
                     // change and the Dock icon hides when no window remains.
                     let app_handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
@@ -405,4 +481,88 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial(i18n_locale)]
+    fn tray_menu_entries_are_localized() {
+        rust_i18n::set_locale("en-US");
+        let entries = tray_menu_entries();
+
+        let expected = [
+            ("show", "Show"),
+            ("add_drive", "Add new drive"),
+            ("settings", "Settings"),
+            ("quit", "Quit"),
+        ];
+
+        assert_eq!(entries.len(), expected.len());
+        for ((id, title), (expected_id, expected_title)) in entries.iter().zip(expected.iter()) {
+            assert_eq!(*id, *expected_id);
+            assert_eq!(title, *expected_title);
+        }
+    }
+
+    #[test]
+    fn normalize_locale_handles_script_subtag() {
+        assert_eq!(normalize_locale("zh-Hans-CN"), "zh-CN");
+        assert_eq!(normalize_locale("zh-Hant-TW"), "zh-TW");
+    }
+
+    #[test]
+    fn normalize_locale_is_case_insensitive() {
+        assert_eq!(normalize_locale("EN-us"), "en-US");
+        assert_eq!(normalize_locale("ZH-cn"), "zh-CN");
+    }
+
+    #[test]
+    fn normalize_locale_falls_back_to_default() {
+        assert_eq!(normalize_locale("xx-YY"), "en-US");
+        assert_eq!(normalize_locale(""), "en-US");
+    }
+
+    #[test]
+    #[serial(i18n_locale)]
+    fn tray_menu_entries_are_not_raw_i18n_keys() {
+        rust_i18n::set_locale("en-US");
+        let entries = tray_menu_entries();
+
+        let raw_keys = ["show", "addNewDrive", "settings", "quit"];
+        for ((id, title), raw_key) in entries.iter().zip(raw_keys.iter()) {
+            assert_ne!(
+                title, *raw_key,
+                "menu title for {} should be localized, not raw key",
+                id
+            );
+        }
+    }
+
+    #[test]
+    #[serial(i18n_locale)]
+    fn tray_menu_entries_update_with_locale() {
+        rust_i18n::set_locale("zh-CN");
+        let entries = tray_menu_entries();
+        assert_eq!(entries[0].1, "显示");
+        assert_eq!(entries[1].1, "添加新云盘");
+        assert_eq!(entries[2].1, "设置");
+        assert_eq!(entries[3].1, "退出");
+    }
+
+    #[test]
+    #[serial(i18n_locale)]
+    fn tray_menu_entries_fallback_to_default_locale() {
+        // When the locale is unknown, rust_i18n should fall back to en-US
+        // instead of returning raw i18n keys.
+        rust_i18n::set_locale("xx-YY");
+        let entries = tray_menu_entries();
+        assert_eq!(entries[0].1, "Show");
+        assert_eq!(entries[1].1, "Add new drive");
+        assert_eq!(entries[2].1, "Settings");
+        assert_eq!(entries[3].1, "Quit");
+    }
 }

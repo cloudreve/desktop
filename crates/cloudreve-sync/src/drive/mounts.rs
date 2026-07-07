@@ -146,6 +146,7 @@ pub struct Mount {
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     props_refresh_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    initial_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     fs_watcher: Mutex<Option<FsWatcher>>,
     pub(crate) sync_lock: Mutex<()>,
@@ -258,6 +259,7 @@ impl Mount {
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
             props_refresh_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            initial_sync_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cr_client: cr_client_arc,
             inventory,
             task_queue,
@@ -368,6 +370,12 @@ impl Mount {
             .lock()
             .await
             .set_event_push_subscribed(subscribed);
+    }
+
+    /// Store the handle for the background initial sync task so it can be
+    /// cancelled and awaited during shutdown.
+    pub async fn set_initial_sync_handle(&self, handle: JoinHandle<()>) {
+        *self.initial_sync_handle.lock().await = Some(handle);
     }
 
     pub fn task_queue(&self) -> Arc<TaskQueue> {
@@ -694,6 +702,7 @@ impl Mount {
         if let Some(handle) = self.remote_event_handle.lock().await.take() {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping remote event listener");
             handle.abort();
+            let _ = handle.await;
         }
 
         if let Some(fs_watcher) = self.fs_watcher.lock().await.take() {
@@ -708,12 +717,32 @@ impl Mount {
         if let Some(handle) = self.processor_handle.lock().await.take() {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Waiting for command processor to finish");
             handle.abort();
+            let _ = handle.await;
         }
 
         // Stop the props refresh task
         if let Some(handle) = self.props_refresh_handle.lock().await.take() {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping props refresh task");
             handle.abort();
+            let _ = handle.await;
+        }
+
+        // Stop any in-progress initial sync so we don't leave partial file
+        // writes or dangling API sessions when the app quits.
+        if let Some(handle) = self.initial_sync_handle.lock().await.take() {
+            tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping initial sync task");
+            handle.abort();
+            match handle.await {
+                Ok(()) => {
+                    tracing::debug!(target: "drive::mounts", id=%self.id, "Initial sync task finished");
+                }
+                Err(e) if e.is_cancelled() => {
+                    tracing::debug!(target: "drive::mounts", id=%self.id, "Initial sync task cancelled");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "drive::mounts", id=%self.id, error=?e, "Initial sync task panicked");
+                }
+            }
         }
         // self.queue.shutdown().await;
     }
@@ -848,5 +877,79 @@ fn resolve_task_queue_config(config: &DriveConfig) -> TaskQueueConfig {
 
     TaskQueueConfig {
         max_concurrent: concurrency,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Create a minimal Mount in a temporary directory for testing.
+    async fn create_test_mount(temp_dir: &TempDir) -> Arc<Mount> {
+        let db_path = temp_dir.path().join("inventory.db");
+        let inventory = Arc::new(InventoryDb::with_path(db_path).unwrap());
+        let sync_path = temp_dir.path().join("sync");
+        std::fs::create_dir(&sync_path).unwrap();
+
+        let config = DriveConfig {
+            id: "test-drive".to_string(),
+            name: "Test Drive".to_string(),
+            instance_url: "https://example.com".to_string(),
+            remote_path: "my:///".to_string(),
+            credentials: Credentials {
+                access_token: Some("token".to_string()),
+                refresh_token: "refresh".to_string(),
+                refresh_expires: "never".to_string(),
+                access_expires: Some("never".to_string()),
+            },
+            sync_path,
+            icon_path: None,
+            raw_icon_path: None,
+            enabled: true,
+            user_id: "user".to_string(),
+            sync_root_id: None,
+            ignore_patterns: vec![],
+            extra: HashMap::new(),
+        };
+
+        let (manager_tx, _manager_rx) = mpsc::unbounded_channel();
+        Arc::new(Mount::new(config, inventory, manager_tx).await)
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_initial_sync_handle() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount = create_test_mount(&temp_dir).await;
+
+        // Spawn a task that would run forever and set it as the initial sync handle.
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        mount.set_initial_sync_handle(handle).await;
+        assert!(mount.initial_sync_handle.lock().await.is_some());
+
+        // Shutdown should cancel and await the initial sync task.
+        mount.shutdown().await;
+
+        // The handle should have been removed.
+        assert!(mount.initial_sync_handle.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_existing_handles() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount = create_test_mount(&temp_dir).await;
+
+        mount.spawn_command_processor(mount.clone()).await;
+        assert!(mount.processor_handle.lock().await.is_some());
+
+        mount.shutdown().await;
+
+        // Command processor handle should be cleared.
+        assert!(mount.processor_handle.lock().await.is_none());
     }
 }

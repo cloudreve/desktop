@@ -30,7 +30,7 @@ pub const USER_AGENT: &str = concat!("cloudreve-desktop/", env!("CARGO_PKG_VERSI
 #[macro_use]
 extern crate rust_i18n;
 
-i18n!("../../locales");
+i18n!("../../locales", fallback = "en-US");
 
 /// Initialize the application root path (Windows Package detection)
 pub fn init_app_root() {

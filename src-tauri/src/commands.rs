@@ -394,7 +394,7 @@ fn file_icon_to_response(icon: file_icon_provider::Icon) -> FileIconResponse {
 /// Returns base64 encoded RGBA pixel data with dimensions
 #[tauri::command]
 pub async fn get_file_icon(
-    app: AppHandle,
+    #[allow(unused_variables)] app: AppHandle,
     path: String,
     size: Option<u16>,
 ) -> CommandResult<FileIconResponse> {
@@ -523,6 +523,21 @@ fn apply_default_window_icon<'a>(
     }
 }
 
+/// Attach a handler that updates macOS Dock visibility when the window is
+/// closed or destroyed, so the Dock icon hides when no window remains visible.
+#[cfg(target_os = "macos")]
+fn update_dock_on_window_close(window: &WebviewWindow) {
+    let window_clone = window.clone();
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) {
+            crate::update_dock_visibility(&window_clone.app_handle());
+        }
+    });
+}
+
 /// Internal function to show or create the main window at a specific position
 fn show_main_window_at_position(app: &AppHandle, position: Position) {
     // Check if window already exists
@@ -562,13 +577,18 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            update_dock_on_window_close(&window);
+
             // Set up close request handler for fast popup launch
             let window_clone = window.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     // Check if fast popup launch is enabled
                     if ConfigManager::get().fast_popup_launch() {
-                        // Prevent default close behavior and hide window instead
+                        // Prevent default close behavior and hide window instead.
+                        // Dock visibility is re-evaluated by the global WindowEvent
+                        // handler after a short delay.
                         api.prevent_close();
                         let _ = window_clone.hide();
                     }
@@ -686,6 +706,22 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            {
+                update_dock_on_window_close(&window);
+
+                // Dismiss the add-drive/reauthorize window when clicking outside
+                // so it doesn't stay open on macOS.
+                let window_for_events = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(false) = event {
+                        // Hide when clicking outside. Dock visibility is
+                        // re-evaluated by the global WindowEvent handler.
+                        let _ = window_for_events.hide();
+                    }
+                });
+            }
+
             #[cfg(windows)]
             {
                 let _ = window.set_transparent(true);
@@ -725,6 +761,15 @@ pub fn show_settings_window_impl(app: &AppHandle) {
         return;
     }
 
+    // Create new window with mica effect on Windows only.
+    #[cfg(windows)]
+    let effects = WindowEffectsConfig {
+        effects: vec![WindowEffect::Mica, WindowEffect::Acrylic],
+        state: None,
+        radius: None,
+        color: None,
+    };
+
     let builder = WebviewWindowBuilder::new(
         app,
         "settings",
@@ -755,6 +800,9 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            update_dock_on_window_close(&window);
+
             #[cfg(windows)]
             {
                 let _ = window.set_transparent(true);
@@ -1184,6 +1232,12 @@ pub async fn set_language(app: AppHandle, language: Option<String>) -> CommandRe
     let locale = language
         .unwrap_or_else(|| sys_locale::get_locale().unwrap_or_else(|| String::from("en-US")));
     rust_i18n::set_locale(&locale);
+
+    // Rebuild the tray context menu with the new locale so it doesn't show
+    // raw i18n keys.
+    if let Err(e) = crate::rebuild_tray_menu(&app) {
+        tracing::warn!(target: "main", error = %e, "Failed to rebuild tray menu after language change");
+    }
 
     // Close main window to force reload with new language
     // Check if window already exists

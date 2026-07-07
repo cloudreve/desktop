@@ -233,7 +233,7 @@ impl DriveManager {
 
         // Spawn initial sync in the background so add_drive returns immediately
         let mount_for_sync = mount_arc.clone();
-        tokio::spawn(async move {
+        let initial_sync_handle = tokio::spawn(async move {
             let sync_path = mount_for_sync.config.read().await.sync_path.clone();
             tracing::info!(target: "drive", id = %mount_for_sync.id, path = %sync_path.display(), "Starting background initial sync");
             if let Err(e) = mount_for_sync
@@ -245,6 +245,7 @@ impl DriveManager {
                 tracing::info!(target: "drive", id = %mount_for_sync.id, "Background initial sync completed");
             }
         });
+        mount_arc.set_initial_sync_handle(initial_sync_handle).await;
 
         let mut write_guard = self.drives.write().await;
         let id = mount_arc.id.clone();
