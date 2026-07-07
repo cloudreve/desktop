@@ -524,16 +524,22 @@ fn apply_default_window_icon<'a>(
 }
 
 /// Attach a handler that updates macOS Dock visibility when the window is
-/// closed or destroyed, so the Dock icon hides when no window remains visible.
+/// closed, destroyed, or loses focus. This is a per-window safeguard in
+/// addition to the global `RunEvent::WindowEvent` handler because some window
+/// state changes (e.g. clicking outside the add-drive/settings popup) are not
+/// reliably reflected by `webview_windows()`/`is_visible()` immediately. The
+/// check is retried several times to give AppKit time to catch up.
 #[cfg(target_os = "macos")]
 fn update_dock_on_window_close(window: &WebviewWindow) {
     let window_clone = window.clone();
     window.on_window_event(move |event| {
         if matches!(
             event,
-            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            tauri::WindowEvent::CloseRequested { .. }
+                | tauri::WindowEvent::Destroyed
+                | tauri::WindowEvent::Focused(false)
         ) {
-            crate::update_dock_visibility(&window_clone.app_handle());
+            crate::schedule_update_dock_visibility(&window_clone.app_handle().clone());
         }
     });
 }
@@ -580,18 +586,36 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
             #[cfg(target_os = "macos")]
             update_dock_on_window_close(&window);
 
-            // Set up close request handler for fast popup launch
-            let window_clone = window.clone();
+            // Set up window event handlers for macOS:
+            // - CloseRequested: when fast popup launch is enabled, hide instead of
+            //   destroying so the popup can be reshown quickly.
+            // - Focused(false): dismiss the popup when clicking outside and update
+            //   Dock visibility immediately.
+            let window_for_events = window.clone();
             window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    // Check if fast popup launch is enabled
-                    if ConfigManager::get().fast_popup_launch() {
-                        // Prevent default close behavior and hide window instead.
-                        // Dock visibility is re-evaluated by the global WindowEvent
-                        // handler after a short delay.
-                        api.prevent_close();
-                        let _ = window_clone.hide();
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        if ConfigManager::get().fast_popup_launch() {
+                            api.prevent_close();
+                            let _ = window_for_events.hide();
+                            // The window is hidden rather than destroyed; make
+                            // sure the Dock icon is re-evaluated repeatedly.
+                            #[cfg(target_os = "macos")]
+                            crate::schedule_update_dock_visibility(
+                                &window_for_events.app_handle().clone(),
+                            );
+                        }
                     }
+                    #[cfg(target_os = "macos")]
+                    tauri::WindowEvent::Focused(false) => {
+                        let _ = window_for_events.hide();
+                        // Schedule multiple Dock visibility checks because the
+                        // window state reported by Tauri can lag behind AppKit.
+                        crate::schedule_update_dock_visibility(
+                            &window_for_events.app_handle().clone(),
+                        );
+                    }
+                    _ => {}
                 }
             });
 
@@ -711,13 +735,16 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
                 update_dock_on_window_close(&window);
 
                 // Dismiss the add-drive/reauthorize window when clicking outside
-                // so it doesn't stay open on macOS.
+                // so it doesn't stay open on macOS. Schedule several Dock
+                // visibility checks because the window state can lag behind
+                // AppKit after the hide.
                 let window_for_events = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        // Hide when clicking outside. Dock visibility is
-                        // re-evaluated by the global WindowEvent handler.
                         let _ = window_for_events.hide();
+                        crate::schedule_update_dock_visibility(
+                            &window_for_events.app_handle().clone(),
+                        );
                     }
                 });
             }
@@ -1228,10 +1255,9 @@ pub async fn set_language(app: AppHandle, language: Option<String>) -> CommandRe
         .set_language(language.clone())
         .map_err(|e| e.to_string())?;
 
-    // Update rust_i18n locale
-    let locale = language
-        .unwrap_or_else(|| sys_locale::get_locale().unwrap_or_else(|| String::from("en-US")));
-    rust_i18n::set_locale(&locale);
+    // Update rust_i18n locale to the effective locale (config setting or
+    // normalized system locale).
+    rust_i18n::set_locale(&crate::get_effective_locale());
 
     // Rebuild the tray context menu with the new locale so it doesn't show
     // raw i18n keys.

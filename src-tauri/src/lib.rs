@@ -206,6 +206,26 @@ pub fn update_dock_visibility(app: &AppHandle) {
     }
 }
 
+/// Schedule multiple delayed checks of the Dock visibility.
+///
+/// `webview_windows()`/`is_visible()` can lag behind the actual window state on
+/// macOS, especially after a window is hidden or closed by clicking outside the
+/// frame. Calling `update_dock_visibility` immediately and then several more
+/// times gives AppKit enough time to reflect the new visibility state so the
+/// Dock icon reliably hides when no window is visible.
+#[cfg(target_os = "macos")]
+pub fn schedule_update_dock_visibility(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for delay_ms in [0, 50, 150, 350, 750] {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            update_dock_visibility(&app);
+        }
+    });
+}
+
 impl AppStateHandle {
     pub fn get(&self) -> Option<&'static AppState> {
         APP_STATE.get()
@@ -261,13 +281,27 @@ async fn shutdown() {
     tracing::info!(target: "main", "Shutdown complete");
 }
 
+/// Resolve a tray menu label, falling back to the English text when rust_i18n
+/// returns the raw key. This guards against missing translations or an
+/// unloaded locale, which has been observed to show raw i18n keys on macOS.
+macro_rules! tray_label {
+    ($key:literal, $default:literal) => {{
+        let translated = t!($key).to_string();
+        if translated == $key || translated.is_empty() {
+            $default.to_string()
+        } else {
+            translated
+        }
+    }};
+}
+
 /// Return the tray menu item IDs and their localized titles.
 fn tray_menu_entries() -> [(&'static str, String); 4] {
     [
-        ("show", t!("show").to_string()),
-        ("add_drive", t!("addNewDrive").to_string()),
-        ("settings", t!("settings").to_string()),
-        ("quit", t!("quit").to_string()),
+        ("show", tray_label!("show", "Show")),
+        ("add_drive", tray_label!("addNewDrive", "Add new drive")),
+        ("settings", tray_label!("settings", "Settings")),
+        ("quit", tray_label!("quit", "Quit")),
     ]
 }
 
@@ -469,14 +503,11 @@ pub fn run() {
                         | tauri::WindowEvent::Focused(false),
                     ..
                 } => {
-                    // Re-evaluate Dock visibility shortly after a window loses focus
-                    // or is closed/destroyed, so webview_windows() reflects the
-                    // change and the Dock icon hides when no window remains.
-                    let app_handle = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        update_dock_visibility(&app_handle);
-                    });
+                    // Re-evaluate Dock visibility several times after a window loses
+                    // focus or is closed/destroyed. `webview_windows()`/`is_visible()`
+                    // can lag, so retrying makes sure the Dock icon hides when no
+                    // window remains.
+                    crate::schedule_update_dock_visibility(app_handle);
                 }
                 _ => {}
             }
