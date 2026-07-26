@@ -731,23 +731,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
     match builder.build() {
         Ok(window) => {
             #[cfg(target_os = "macos")]
-            {
-                update_dock_on_window_close(&window);
-
-                // Dismiss the add-drive/reauthorize window when clicking outside
-                // so it doesn't stay open on macOS. Schedule several Dock
-                // visibility checks because the window state can lag behind
-                // AppKit after the hide.
-                let window_for_events = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = window_for_events.hide();
-                        crate::schedule_update_dock_visibility(
-                            &window_for_events.app_handle().clone(),
-                        );
-                    }
-                });
-            }
+            update_dock_on_window_close(&window);
 
             #[cfg(windows)]
             {
