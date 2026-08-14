@@ -4,7 +4,9 @@ use crate::utils::toast::send_conflict_toast;
 use crate::{
     drive::{
         placeholder::CrPlaceholder,
-        sync::{calculate_file_hash, remote_file_hash_fingerprint},
+        sync::{
+            calculate_file_hash, local_snapshot_differs, remote_file_hash_fingerprint,
+        },
         utils::local_path_to_cr_uri,
     },
     inventory::{ConflictState, FileMetadata, InventoryDb},
@@ -113,18 +115,6 @@ impl<'a> UploadTask<'a> {
             return Ok(());
         }
 
-        if placeholder_file.local_file_info.in_sync()
-            && !placeholder_file.local_file_info.is_directory()
-        {
-            info!(
-                target: "tasks::upload",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "Local file is in sync, skipping upload"
-            );
-            return Ok(());
-        }
-
         let is_directory = placeholder_file.local_file_info.is_directory;
         let file_size = placeholder_file.local_file_info.file_size.unwrap_or(0);
         self.local_file = Some(placeholder_file);
@@ -140,6 +130,35 @@ impl<'a> UploadTask<'a> {
             .inventory
             .query_by_path(path_str)
             .context("failed to get inventory meta")?;
+
+        // Skip only when the file is flagged in-sync AND the recorded local
+        // snapshot still matches the current on-disk state. A stale IN_SYNC
+        // flag (e.g. set by a concurrent metadata refresh while local edits
+        // existed) must not silently drop the pending upload.
+        let snapshot_differs = self
+            .local_file
+            .as_ref()
+            .and_then(|file| self.inventory_meta.as_ref().map(|meta| (meta, &file.local_file_info)))
+            .map(|(meta, info)| local_snapshot_differs(meta, info))
+            .unwrap_or(false);
+
+        if self
+            .local_file
+            .as_ref()
+            .unwrap()
+            .local_file_info
+            .in_sync()
+            && !is_directory
+            && !snapshot_differs
+        {
+            info!(
+                target: "tasks::upload",
+                task_id = %self.task.task_id,
+                local_path = %self.task.payload.local_path_display(),
+                "Local file is in sync, skipping upload"
+            );
+            return Ok(());
+        }
 
         // clear file error state
         // Mark file as error state

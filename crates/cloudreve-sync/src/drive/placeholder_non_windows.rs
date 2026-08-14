@@ -129,8 +129,23 @@ impl CrPlaceholder {
             std::fs::create_dir_all(parent).context("failed to create parent directory")?;
         }
 
+        let mut entry = MetadataEntry::from(file_meta);
+        match LocalFileInfo::from_path(&self.local_path) {
+            Ok(fresh) if fresh.exists => {
+                let mtime_ms = fresh.last_modified.and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as i64)
+                });
+                if let (Some(mtime_ms), Some(size)) = (mtime_ms, fresh.file_size) {
+                    entry = entry.with_local_snapshot(mtime_ms, size as i64);
+                }
+            }
+            _ => {}
+        }
+
         inventory
-            .upsert(&MetadataEntry::from(file_meta))
+            .upsert(&entry)
             .context("failed to upsert inventory")?;
         self.local_file_info =
             LocalFileInfo::from_path(&self.local_path).unwrap_or_else(|_| LocalFileInfo::missing());
@@ -175,6 +190,8 @@ impl CrPlaceholder {
             metadata: file_info.metadata.clone().unwrap_or_default(),
             props: None,
             conflict_state: None,
+            local_updated_at: None,
+            local_size: None,
         });
         self
     }

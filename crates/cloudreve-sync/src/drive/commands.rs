@@ -6,7 +6,7 @@ use crate::{
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
-        sync::{GroupedFsEvents, SyncMode},
+        sync::{GroupedFsEvents, SyncMode, local_snapshot_differs},
         utils::{local_path_to_cr_uri, notify_shell_change},
     },
     inventory::ConflictState,
@@ -964,8 +964,22 @@ impl Mount {
                 continue;
             }
 
-            // General modification, quque a upload task if not exist
-            if !placeholder_info.in_sync() {
+            // General modification, queue an upload task if not exist.
+            // Also queue when the recorded local snapshot no longer matches
+            // the on-disk state even though the IN_SYNC flag looks set - the
+            // flag may be stale after a race with a metadata refresh.
+            let snapshot_differs = match path.to_str() {
+                Some(path_str) => self
+                    .inventory
+                    .query_by_path(path_str)
+                    .map(|entry| {
+                        entry.is_some_and(|meta| local_snapshot_differs(&meta, &placeholder_info))
+                    })
+                    .unwrap_or(false),
+                None => false,
+            };
+
+            if !placeholder_info.in_sync() || snapshot_differs {
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Queuing upload task for modified file");
                 let payload = TaskPayload::upload(path.clone());
                 let result = self

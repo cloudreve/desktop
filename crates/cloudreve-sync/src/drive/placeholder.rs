@@ -222,9 +222,28 @@ impl CrPlaceholder {
                 .context("failed to create placeholder")?;
         }
 
-        // Upser inventory
+        // Record a local snapshot (mtime + size) so future syncs can detect
+        // local edits even when the CFAPI IN_SYNC flag is stale or cleared by
+        // a race. The snapshot is read from disk after the metadata update so
+        // it always reflects the state this sync point produces.
+        let mut entry = MetadataEntry::from(file_meta);
+        match LocalFileInfo::from_path(&self.local_path) {
+            Ok(fresh) if fresh.exists => {
+                let mtime_ms = fresh.last_modified.and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as i64)
+                });
+                if let (Some(mtime_ms), Some(size)) = (mtime_ms, fresh.file_size) {
+                    entry = entry.with_local_snapshot(mtime_ms, size as i64);
+                }
+            }
+            _ => {}
+        }
+
+        // Upsert inventory
         inventory
-            .upsert(&MetadataEntry::from(file_meta))
+            .upsert(&entry)
             .context("failed to upsert inventory")?;
 
         // Notify shell change
@@ -267,6 +286,8 @@ impl CrPlaceholder {
             permissions: file_info.permission.clone().unwrap_or_default(),
             shared: file_info.shared.unwrap_or(false),
             conflict_state: None,
+            local_updated_at: None,
+            local_size: None,
         });
         self
     }

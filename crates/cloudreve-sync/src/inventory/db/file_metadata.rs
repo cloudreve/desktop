@@ -266,6 +266,8 @@ struct FileMetadataRow {
     shared: bool,
     size: i64,
     conflict_state: Option<String>,
+    local_updated_at: Option<i64>,
+    local_size: Option<i64>,
 }
 
 #[derive(Insertable)]
@@ -283,6 +285,8 @@ struct NewFileMetadata {
     shared: bool,
     size: i64,
     conflict_state: Option<String>,
+    local_updated_at: Option<i64>,
+    local_size: Option<i64>,
 }
 
 #[derive(AsChangeset)]
@@ -301,6 +305,10 @@ struct FileMetadataChangeset {
     /// - Some(None) explicitly sets conflict_state to NULL
     /// - Some(Some(value)) sets it to a value
     conflict_state: Option<Option<String>>,
+    /// Local snapshots are only overwritten when the new entry carries one;
+    /// entries built without snapshot info leave the stored value untouched.
+    local_updated_at: Option<Option<i64>>,
+    local_size: Option<Option<i64>>,
 }
 
 impl TryFrom<FileMetadataRow> for FileMetadata {
@@ -334,6 +342,8 @@ impl TryFrom<FileMetadataRow> for FileMetadata {
             shared: row.shared,
             size: row.size,
             conflict_state,
+            local_updated_at: row.local_updated_at,
+            local_size: row.local_size,
         })
     }
 }
@@ -361,6 +371,8 @@ impl TryFrom<&MetadataEntry> for NewFileMetadata {
             shared: entry.shared,
             size: entry.size,
             conflict_state: entry.conflict_state.map(|s| s.as_str().to_string()),
+            local_updated_at: entry.local_updated_at,
+            local_size: entry.local_size,
         })
     }
 }
@@ -385,6 +397,9 @@ impl FileMetadataChangeset {
             size: entry.size,
             // Use Some(...) to always update the column, even when clearing to NULL
             conflict_state: Some(entry.conflict_state.map(|s| s.as_str().to_string())),
+            // Keep the stored snapshot when the entry carries none
+            local_updated_at: entry.local_updated_at.map(Some),
+            local_size: entry.local_size.map(Some),
         })
     }
 }
