@@ -23,7 +23,9 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+#[cfg(windows)]
+use tracing::warn;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
