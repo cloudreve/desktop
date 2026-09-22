@@ -5,27 +5,61 @@ use crate::inventory::{
 use anyhow::{Context, Result};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::inventory::schema::file_metadata::{self, dsl as file_metadata_dsl};
 
 impl InventoryDb {
+    /// Insert file metadata entries in bulk, refreshing rows that already exist.
+    ///
+    /// The same local path is re-enumerated on every mount, remount and folder expansion, so a
+    /// plain `INSERT` aborts the entire batch with `UNIQUE constraint failed:
+    /// file_metadata.local_path` as soon as one of the paths is already known. The caller only
+    /// logs that error while the placeholders have already been handed to the OS, which leaves
+    /// the visible tree and the inventory disagreeing and makes later operations fail with
+    /// `Path not exist: ent: file not found`.
+    ///
+    /// `created_at` and `conflict_state` are deliberately left untouched for existing rows:
+    /// re-enumerating a path must not reset its age nor clear a conflict that still awaits the
+    /// user's decision.
     pub fn batch_insert(&self, entries: &[MetadataEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        let rows: Vec<NewFileMetadata> = entries
-            .iter()
-            .map(NewFileMetadata::try_from)
-            .collect::<Result<_>>()?;
+        // Collapse repeated paths so a single batch never touches the same row twice.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+        let mut upserts: Vec<(NewFileMetadata, FileMetadataChangeset)> =
+            Vec::with_capacity(entries.len());
+        for entry in entries {
+            if !seen.insert(entry.local_path.as_str()) {
+                continue;
+            }
+            let mut changeset = FileMetadataChangeset::from_entry(entry)?;
+            // Leaving this as None keeps the column out of the SET clause: re-enumerating a
+            // path must not clear a conflict that is still waiting for the user's decision.
+            changeset.conflict_state = None;
+            upserts.push((NewFileMetadata::try_from(entry)?, changeset));
+        }
 
+        // A single multi-row `INSERT ... ON CONFLICT` is not expressible in Diesel's SQLite
+        // backend, so the rows are upserted one by one inside one transaction (which is still
+        // a single fsync per batch).
         let mut conn = self.connection()?;
-        diesel::insert_into(file_metadata::table)
-            .values(&rows)
-            .execute(&mut conn)
-            .context("Failed to batch insert inventory metadata")?;
+        (&mut *conn)
+            .transaction::<(), diesel::result::Error, _>(|tx_conn| {
+                for (row, changeset) in &upserts {
+                    diesel::insert_into(file_metadata::table)
+                        .values(row)
+                        .on_conflict(file_metadata::local_path)
+                        .do_update()
+                        .set(changeset)
+                        .execute(tx_conn)?;
+                }
+                Ok(())
+            })
+            .context("Failed to batch upsert inventory metadata")?;
         Ok(())
     }
 
@@ -352,5 +386,65 @@ impl FileMetadataChangeset {
             // Use Some(...) to always update the column, even when clearing to NULL
             conflict_state: Some(entry.conflict_state.map(|s| s.as_str().to_string())),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata_entry(local_path: &str, etag: &str, size: i64) -> MetadataEntry {
+        MetadataEntry::new(Uuid::new_v4(), local_path, false)
+            .with_etag(etag)
+            .with_size(size)
+            .with_created_at(1_700_000_000)
+            .with_updated_at(1_700_000_000)
+    }
+
+    fn test_db() -> (tempfile::TempDir, InventoryDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = InventoryDb::with_path(dir.path().join("meta.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn batch_insert_refreshes_existing_paths_instead_of_failing() {
+        let (_dir, db) = test_db();
+        let path = r"C:\drive\个人\软件\linux\wps";
+
+        db.batch_insert(&[
+            metadata_entry(path, "etag-1", 10),
+            metadata_entry(r"C:\drive\个人", "etag-1", 0),
+        ])
+        .unwrap();
+
+        // Re-enumerating a folder that is already known must refresh the entry instead of
+        // aborting the batch, which is what used to happen on the second enumeration.
+        db.batch_insert(&[metadata_entry(path, "etag-2", 42)])
+            .unwrap();
+
+        let row = db.query_by_path(path).unwrap().expect("row must exist");
+        assert_eq!(row.etag, "etag-2");
+        assert_eq!(row.size, 42);
+        assert_eq!(row.created_at, 1_700_000_000, "created_at is preserved");
+        assert_eq!(db.count().unwrap(), 2, "no duplicate rows");
+    }
+
+    #[test]
+    fn batch_insert_keeps_pending_conflict_state() {
+        let (_dir, db) = test_db();
+        let path = r"C:\drive\doc.txt";
+
+        db.batch_insert(&[metadata_entry(path, "etag-1", 10)])
+            .unwrap();
+        db.mark_as_conflicted(path, Some(ConflictState::Pending))
+            .unwrap();
+
+        db.batch_insert(&[metadata_entry(path, "etag-2", 11)])
+            .unwrap();
+
+        let row = db.query_by_path(path).unwrap().unwrap();
+        assert_eq!(row.etag, "etag-2");
+        assert_eq!(row.conflict_state, Some(ConflictState::Pending));
     }
 }
