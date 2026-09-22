@@ -386,6 +386,18 @@ fn next_child_mode(mode: SyncMode) -> SyncMode {
     }
 }
 
+/// Whether the server answered `ParentNotExist` (40016) for a directory listing.
+///
+/// The code is returned both when the directory is really gone and when the server cannot
+/// resolve the requested URI, so on its own it is *not* proof that the entries below that
+/// directory were removed. See the call sites for what that distinction is worth.
+fn is_parent_missing(err: &ApiError) -> bool {
+    matches!(
+        err,
+        ApiError::ApiError { code, .. } if *code == ErrorCode::ParentNotExist as i32
+    )
+}
+
 /// Result of collecting child targets, including pre-fetched remote file info.
 struct CollectChildResult {
     /// All child paths (union of local and remote).
@@ -815,18 +827,23 @@ impl Mount {
                 .await
             {
                 Ok(resp) => resp,
-                Err(ApiError::ApiError { code, .. })
-                    if code == ErrorCode::ParentNotExist as i32 =>
-                {
-                    tracing::debug!(
-                        target: "drive::sync",
-                        id = %self.id,
-                        parent = %parent.display(),
-                        "Remote parent directory missing during fetch"
-                    );
-                    return Ok(HashMap::new());
-                }
+                // A `ParentNotExist` answer only tells us that listing `parent` failed - it is not
+                // evidence that the requested entries were deleted on the server. Reporting them as
+                // remote-missing makes `plan_entry_with_local_only` delete the local placeholder
+                // together with its inventory row, and because the row is what the sync engine uses
+                // to find an entry again, no later sync tick can restore it. Entries that really were
+                // deleted are discovered by the sync group of their *parent* directory, whose listing
+                // succeeds and simply does not contain them, so skipping this group and retrying on
+                // the next tick is safe as well as sufficient.
                 Err(err) => {
+                    if is_parent_missing(&err) {
+                        tracing::warn!(
+                            target: "drive::sync",
+                            id = %self.id,
+                            parent = %parent.display(),
+                            "Server reported the parent directory as missing while fetching a sync group; skipping sync group"
+                        );
+                    }
                     return Err(err.into());
                 }
             };
@@ -1354,18 +1371,18 @@ impl Mount {
                 .await
             {
                 Ok(resp) => resp,
-                Err(ApiError::ApiError { code, .. })
-                    if code == ErrorCode::ParentNotExist as i32 =>
-                {
-                    tracing::debug!(
-                        target: "drive::sync",
-                        id = %self.id,
-                        directory = %directory.display(),
-                        "Remote directory missing during walk"
-                    );
-                    return Ok((Vec::new(), HashMap::new()));
-                }
+                // See `fetch_remote_file_infos`: an empty child list would be planned as "every
+                // child of this directory is gone", deleting local placeholders and their inventory
+                // rows. Abort the walk instead and let the next tick retry.
                 Err(err) => {
+                    if is_parent_missing(&err) {
+                        tracing::warn!(
+                            target: "drive::sync",
+                            id = %self.id,
+                            directory = %directory.display(),
+                            "Server reported the directory as missing while walking it; skipping walk"
+                        );
+                    }
                     return Err(err.into());
                 }
             };
