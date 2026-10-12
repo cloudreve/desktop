@@ -3,9 +3,10 @@
 //! This module provides a download task that:
 //! - Downloads file content from remote server to a temporary location
 //! - Tracks download progress with speed and ETA calculation
-//! - Replaces the placeholder file content atomically when finished
+//! - Replaces the local file content atomically when finished
 //! - Uses CrPlaceholder to convert and mark the file as in-sync
-//! - Only operates on hydrated placeholder files
+//! - On Windows, only operates on hydrated placeholder files; on other
+//!   platforms (full sync), creates or replaces the real local file
 
 use std::{
     path::PathBuf,
@@ -23,7 +24,9 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+#[cfg(windows)]
+use tracing::warn;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -213,16 +216,6 @@ impl<'a> DownloadTask<'a> {
         let local_file_info = LocalFileInfo::from_path(&self.task.payload.local_path)
             .context("failed to get local file info")?;
 
-        if !local_file_info.exists {
-            info!(
-                target: "tasks::download",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "Local file does not exist, skipping download"
-            );
-            return Ok(());
-        }
-
         if local_file_info.is_directory {
             info!(
                 target: "tasks::download",
@@ -233,27 +226,42 @@ impl<'a> DownloadTask<'a> {
             return Ok(());
         }
 
-        // Check if file is a placeholder and is hydrated (has content on disk)
-        if !local_file_info.is_placeholder() {
-            info!(
-                target: "tasks::download",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "File is not a placeholder, skipping download"
-            );
-            return Ok(());
-        }
+        // Windows CFAPI placeholders: downloads only replace the content of an
+        // existing, fully hydrated placeholder file.
+        #[cfg(windows)]
+        {
+            if !local_file_info.exists {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    local_path = %self.task.payload.local_path_display(),
+                    "Local file does not exist, skipping download"
+                );
+                return Ok(());
+            }
 
-        // partial_on_disk means the file content is NOT fully present locally
-        // We need the file to be hydrated (NOT partial_on_disk) to replace its content
-        if local_file_info.partial_on_disk() {
-            info!(
-                target: "tasks::download",
-                task_id = %self.task.task_id,
-                local_path = %self.task.payload.local_path_display(),
-                "File is not fully hydrated, skipping download - file must be hydrated first"
-            );
-            return Ok(());
+            // Check if file is a placeholder and is hydrated (has content on disk)
+            if !local_file_info.is_placeholder() {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    local_path = %self.task.payload.local_path_display(),
+                    "File is not a placeholder, skipping download"
+                );
+                return Ok(());
+            }
+
+            // partial_on_disk means the file content is NOT fully present locally
+            // We need the file to be hydrated (NOT partial_on_disk) to replace its content
+            if local_file_info.partial_on_disk() {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    local_path = %self.task.payload.local_path_display(),
+                    "File is not fully hydrated, skipping download - file must be hydrated first"
+                );
+                return Ok(());
+            }
         }
 
         self.local_file_info = Some(local_file_info);
@@ -315,6 +323,21 @@ impl<'a> DownloadTask<'a> {
 
         let file_size = file_info.size as u64;
         self.remote_file_info = Some(file_info);
+
+        // Non-Windows full sync: the sync planner also enqueues downloads when
+        // only remote metadata changed. Skip the transfer when the local file
+        // already matches the remote version (same etag, unchanged since the
+        // last synced snapshot).
+        #[cfg(not(windows))]
+        if self.is_already_synced() {
+            info!(
+                target: "tasks::download",
+                task_id = %self.task.task_id,
+                local_path = %self.task.payload.local_path_display(),
+                "Local file already matches remote version, skipping download"
+            );
+            return Ok(());
+        }
 
         // Get download URL from server using inventory metadata for entity validation
         let mut request = FileURLService::default();
@@ -398,6 +421,33 @@ impl<'a> DownloadTask<'a> {
                 Err(e)
             }
         }
+    }
+
+    /// Non-Windows full sync: returns true when the local file already carries
+    /// the remote version - the remote etag matches the inventory record and
+    /// the local file has not changed since the snapshot taken at the last
+    /// successful sync.
+    #[cfg(not(windows))]
+    fn is_already_synced(&self) -> bool {
+        let Some(local) = &self.local_file_info else {
+            return false;
+        };
+        if !local.exists || local.is_directory {
+            return false;
+        }
+        let (Some(meta), Some(remote)) = (&self.inventory_meta, &self.remote_file_info) else {
+            return false;
+        };
+        // A snapshot recorded at a previous sync point is required - without
+        // it we cannot tell whether the on-disk content matches the remote.
+        if meta.local_updated_at.is_none() || meta.local_size.is_none() {
+            return false;
+        }
+        let remote_etag = remote.primary_entity.as_deref().unwrap_or_default();
+        if remote_etag.is_empty() || remote_etag != meta.etag {
+            return false;
+        }
+        !crate::drive::sync::local_snapshot_differs(meta, local)
     }
 
     /// Download file content to a temporary file
@@ -518,7 +568,11 @@ impl<'a> DownloadTask<'a> {
 
         #[cfg(not(windows))]
         {
-            // On non-Windows, just copy the file
+            // On non-Windows, just copy the file (creates it when missing)
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .context("failed to create parent directory")?;
+            }
             std::fs::copy(temp_path, local_path)
                 .context("failed to copy temp file to local path")?;
         }

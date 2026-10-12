@@ -264,6 +264,8 @@ pub struct ChunkUploader {
     cr_client: Arc<CrClient>,
     policy_type: PolicyType,
     config: UploaderConfig,
+    /// Inventory database for persisting chunk progress (resumable uploads)
+    inventory: Option<Arc<crate::inventory::InventoryDb>>,
 }
 
 impl ChunkUploader {
@@ -273,12 +275,14 @@ impl ChunkUploader {
         cr_client: Arc<CrClient>,
         policy_type: PolicyType,
         config: UploaderConfig,
+        inventory: Option<Arc<crate::inventory::InventoryDb>>,
     ) -> Self {
         Self {
             http_client,
             cr_client,
             policy_type,
             config,
+            inventory,
         }
     }
 
@@ -490,6 +494,7 @@ impl ChunkUploader {
         let cr_client = Arc::clone(&self.cr_client);
         let policy_type = self.policy_type;
         let config = self.config.clone();
+        let inventory = self.inventory.clone();
 
         tokio::spawn(async move {
             // Process chunks in a loop until no more chunks or error
@@ -539,6 +544,22 @@ impl ChunkUploader {
                                 state.chunk_progress[chunk_index].loaded = chunk_size;
                                 state.chunk_progress[chunk_index].etag = etag;
                                 state.updated_at = chrono::Utc::now().timestamp();
+                            }
+
+                            // Persist chunk progress so the upload can resume
+                            // after an interruption or process restart
+                            if let Some(inventory) = &inventory
+                                && let Err(e) = inventory.update_upload_session_progress(
+                                    &session.id,
+                                    &state.chunk_progress,
+                                )
+                            {
+                                warn!(
+                                    target: "uploader::chunk",
+                                    chunk = chunk_index,
+                                    error = %e,
+                                    "Failed to persist chunk progress"
+                                );
                             }
                         }
 

@@ -49,6 +49,28 @@ impl InventoryDb {
             .transpose()
     }
 
+    /// Persist the chunk progress of an in-flight upload session so the
+    /// upload can resume after an interruption or process restart.
+    pub fn update_upload_session_progress(
+        &self,
+        session_id: &str,
+        chunk_progress: &[crate::uploader::ChunkProgress],
+    ) -> Result<()> {
+        let mut conn = self.connection()?;
+        let chunk_progress_json = serde_json::to_string(chunk_progress)
+            .context("Failed to serialize chunk progress")?;
+        diesel::update(
+            upload_sessions_dsl::upload_sessions.filter(upload_sessions_dsl::id.eq(session_id)),
+        )
+        .set((
+            upload_sessions_dsl::chunk_progress.eq(chunk_progress_json),
+            upload_sessions_dsl::updated_at.eq(Utc::now().timestamp()),
+        ))
+        .execute(&mut conn)
+        .context("Failed to update upload session progress")?;
+        Ok(())
+    }
+
     /// Delete upload session
     pub fn delete_upload_session(&self, session_id: &str) -> Result<()> {
         let mut conn = self.connection()?;

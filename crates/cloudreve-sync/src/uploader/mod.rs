@@ -136,30 +136,41 @@ impl Uploader {
         );
 
         // Try to resume existing session or create new one
-        let mut session = match self.get_or_create_session(&params).await? {
-            Some(session) => {
+        let (mut session, resumed) = match self.get_or_create_session(&params).await? {
+            Some(existing) if self.session_matches(&existing, &params) => {
+                let uploaded = existing.total_uploaded();
                 info!(
                     target: "uploader",
-                    session_id = %session.session_id(),
-                    "Found existing upload session, removing it"
+                    session_id = %existing.session_id(),
+                    uploaded_bytes = uploaded,
+                    total_bytes = existing.file_size,
+                    "Resuming existing upload session"
                 );
-                if let Err(e) = self.delete_remote_session(&session).await {
+                (existing, true)
+            }
+            Some(stale) => {
+                info!(
+                    target: "uploader",
+                    session_id = %stale.session_id(),
+                    "Existing upload session no longer matches the local file, restarting upload"
+                );
+                if let Err(e) = self.delete_remote_session(&stale).await {
                     warn!(
                         target: "uploader",
-                        session_id = %session.session_id(),
+                        session_id = %stale.session_id(),
                         error = %e,
                         "Failed to delete remote upload session, will continue with new session"
                     );
                 }
-                self.cleanup_session(&session).await?;
-                self.create_session(&params).await?
+                self.cleanup_session(&stale).await?;
+                (self.create_session(&params).await?, false)
             }
             None => {
                 debug!(
                     target: "uploader",
                     "No existing session found, creating new one"
                 );
-                self.create_session(&params).await?
+                (self.create_session(&params).await?, false)
             }
         };
 
@@ -197,16 +208,42 @@ impl Uploader {
                     error = %e,
                     "Upload failed"
                 );
-                if let Err(e) = self.delete_remote_session(&session).await {
+
+                // Persist chunk progress so the upload can be resumed later
+                if let Err(pe) = self.persist_session_progress(&session) {
                     warn!(
                         target: "uploader",
-                        local_path = %params.local_path.display(),
-                        error = %e,
-                        "Failed to delete remote upload session"
+                        session_id = %session.session_id(),
+                        error = %pe,
+                        "Failed to persist chunk progress"
                     );
                 }
-                // Clean up session from database
-                self.cleanup_session(&session).await?;
+
+                // Keep the session for a future resume attempt when the upload
+                // was cancelled (e.g. app shutdown) or when this was the first
+                // attempt for the session. A session that fails again after
+                // being resumed is considered broken and is discarded so the
+                // next attempt starts from a clean slate.
+                let cancelled = self.cancel_token.is_cancelled();
+                if cancelled || !resumed {
+                    info!(
+                        target: "uploader",
+                        session_id = %session.session_id(),
+                        cancelled = cancelled,
+                        "Keeping upload session for later resume"
+                    );
+                } else {
+                    if let Err(e) = self.delete_remote_session(&session).await {
+                        warn!(
+                            target: "uploader",
+                            local_path = %params.local_path.display(),
+                            error = %e,
+                            "Failed to delete remote upload session"
+                        );
+                    }
+                    // Clean up session from database
+                    self.cleanup_session(&session).await?;
+                }
                 Err(e.into())
             }
         }
@@ -260,6 +297,30 @@ impl Uploader {
                 Ok(None)
             }
         }
+    }
+
+    /// Check whether a persisted session still describes the file we are about
+    /// to upload. A session is only safe to resume when the remote target and
+    /// the file size match, and the local file has not been modified after the
+    /// session was created.
+    fn session_matches(&self, session: &UploadSession, params: &UploadParams) -> bool {
+        if session.file_size != params.file_size || session.remote_uri != params.remote_uri {
+            return false;
+        }
+        if let Some(last_modified_ms) = params.last_modified {
+            if last_modified_ms / 1000 > session.created_at {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Persist the current chunk progress of a session to the database.
+    fn persist_session_progress(&self, session: &UploadSession) -> UploadResult<()> {
+        self.inventory
+            .update_upload_session_progress(&session.id, &session.chunk_progress)
+            .map_err(|e| UploadError::DatabaseError(e.to_string()))?;
+        Ok(())
     }
 
     /// Create a new upload session via Cloudreve API
@@ -331,6 +392,7 @@ impl Uploader {
             self.cr_client.clone(),
             policy_type,
             self.config.clone(),
+            Some(self.inventory.clone()),
         );
         Ok(uploader)
     }
