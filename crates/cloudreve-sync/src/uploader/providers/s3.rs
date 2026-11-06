@@ -162,7 +162,7 @@ pub async fn complete_upload_s3like(
         .body(body);
 
     // Add COS-specific header if needed
-    if session.policy_type() == crate::uploader::providers::PolicyType::Cos {
+    if session.effective_policy_type() == crate::uploader::providers::PolicyType::Cos {
         request = request.header("x-cos-forbid-overwrite", "true");
     }
 

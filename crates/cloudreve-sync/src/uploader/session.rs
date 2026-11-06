@@ -20,21 +20,10 @@ pub struct UploadSession {
     pub remote_uri: String,
     /// Total file size
     pub file_size: u64,
-    /// Chunk size for this upload
-    pub chunk_size: u64,
-    /// Policy type
-    #[serde(with = "policy_type_serde")]
-    policy_type: PolicyType,
     /// Upload credential from Cloudreve
     credential: UploadCredential,
-    // Whether relay upload is enabled
-    relay: bool,
     /// Per-chunk progress
     pub chunk_progress: Vec<ChunkProgress>,
-    /// Encryption metadata (if encrypted)
-    pub encrypt_metadata: Option<EncryptMetadata>,
-    /// Session expiration timestamp
-    pub expires_at: i64,
     /// Creation timestamp
     pub created_at: i64,
     /// Last update timestamp
@@ -51,18 +40,12 @@ impl UploadSession {
         file_size: u64,
         credential: UploadCredential,
     ) -> Self {
-        let chunk_size = credential.chunk_size as u64;
+        let chunk_size = credential.chunk_size.max(0) as u64;
         let num_chunks = Self::calculate_num_chunks(file_size, chunk_size);
-        let policy_type = credential
-            .storage_policy
-            .as_ref()
-            .map(|p| PolicyType::from_api(&p.policy_type))
-            .unwrap_or(PolicyType::Local);
 
         let now = Utc::now().timestamp();
         let chunk_progress: Vec<ChunkProgress> =
             (0..num_chunks).map(|i: usize| ChunkProgress::new(i)).collect();
-        let relay = credential.storage_policy.as_ref().and_then(|p| p.relay).unwrap_or(false);
 
         Self {
             id: credential.session_id.clone(),
@@ -71,15 +54,10 @@ impl UploadSession {
             local_path,
             remote_uri,
             file_size,
-            chunk_size,
-            policy_type,
-            encrypt_metadata: credential.encrypt_metadata.clone(),
             chunk_progress,
-            expires_at: credential.expires,
             created_at: now,
             updated_at: now,
             credential,
-            relay,
         }
     }
 
@@ -101,18 +79,32 @@ impl UploadSession {
         &self.credential
     }
 
-    /// Get the policy type
-    pub fn policy_type(&self) -> PolicyType {
-        self.policy_type
+    /// Chunk size for this upload, `0` meaning the whole file is one chunk
+    pub fn chunk_size(&self) -> u64 {
+        self.credential.chunk_size.max(0) as u64
     }
 
-    pub fn is_relay(&self) -> bool {
-        self.relay
+    /// Policy type that actually handles the chunks
+    ///
+    /// A relayed upload is proxied by Cloudreve itself, whatever the policy is.
+    pub(crate) fn effective_policy_type(&self) -> PolicyType {
+        let policy = self.credential.storage_policy.as_ref();
+        if policy.and_then(|p| p.relay).unwrap_or(false) {
+            return PolicyType::Local;
+        }
+        policy
+            .map(|p| PolicyType::from_api(&p.policy_type))
+            .unwrap_or(PolicyType::Local)
+    }
+
+    /// Session expiration timestamp
+    pub fn expires_at(&self) -> i64 {
+        self.credential.expires
     }
 
     /// Check if the session has expired
     pub fn is_expired(&self) -> bool {
-        Utc::now().timestamp() >= self.expires_at
+        Utc::now().timestamp() >= self.expires_at()
     }
 
     /// Get total number of chunks
@@ -136,20 +128,22 @@ impl UploadSession {
 
     /// Get the expected size for a specific chunk
     pub fn chunk_size_for(&self, chunk_index: usize) -> u64 {
-        if self.chunk_size == 0 {
+        let chunk_size = self.chunk_size();
+        if chunk_size == 0 {
             return self.file_size;
         }
-        let start = chunk_index as u64 * self.chunk_size;
+        let start = chunk_index as u64 * chunk_size;
         let remaining = self.file_size.saturating_sub(start);
-        remaining.min(self.chunk_size)
+        remaining.min(chunk_size)
     }
 
     /// Get the byte range for a specific chunk
     pub fn chunk_range(&self, chunk_index: usize) -> (u64, u64) {
-        if self.chunk_size == 0 {
+        let chunk_size = self.chunk_size();
+        if chunk_size == 0 {
             return (0, self.file_size);
         }
-        let start = chunk_index as u64 * self.chunk_size;
+        let start = chunk_index as u64 * chunk_size;
         let size = self.chunk_size_for(chunk_index);
         (start, start + size)
     }
@@ -232,18 +226,14 @@ impl UploadSession {
         self.credential.mime_type.as_deref()
     }
 
-    /// Check if encryption is enabled
-    pub fn is_encrypted(&self) -> bool {
-        self.encrypt_metadata.is_some()
+    /// Encryption metadata the server sent for this upload, if any
+    pub fn encrypt_metadata(&self) -> Option<&EncryptMetadata> {
+        self.credential.encrypt_metadata.as_ref()
     }
 
-    /// Check if streaming encryption is supported
-    pub fn supports_streaming_encryption(&self) -> bool {
-        self.credential
-            .storage_policy
-            .as_ref()
-            .and_then(|p| p.streaming_encryption)
-            .unwrap_or(false)
+    /// Check if encryption is enabled
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypt_metadata().is_some()
     }
 
     /// Get chunk upload concurrency from storage policy
@@ -257,26 +247,5 @@ impl UploadSession {
             .and_then(|p| p.chunk_concurrency)
             .map(|c| c.max(1) as usize)
             .unwrap_or(1)
-    }
-}
-
-/// Serde helper for PolicyType
-mod policy_type_serde {
-    use super::PolicyType;
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(policy_type: &PolicyType, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(policy_type.as_str())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<PolicyType, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(PolicyType::from_str(&s))
     }
 }
