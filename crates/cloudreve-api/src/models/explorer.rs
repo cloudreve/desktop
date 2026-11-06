@@ -189,15 +189,9 @@ pub struct StoragePolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub weight: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub children: Option<Vec<StoragePolicy>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_concurrency: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub streaming_encryption: Option<bool>,
 }
 
 /// List response

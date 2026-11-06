@@ -321,11 +321,7 @@ impl Uploader {
 
     /// Create appropriate chunk uploader based on policy type
     fn create_chunk_uploader(&self, session: &UploadSession) -> UploadResult<ChunkUploader> {
-        let policy_type = if session.is_relay() {
-            providers::PolicyType::Local
-        } else {
-            session.policy_type()
-        };
+        let policy_type = session.effective_policy_type();
         let uploader = ChunkUploader::new(
             self.http_client.clone(),
             self.cr_client.clone(),
@@ -337,7 +333,7 @@ impl Uploader {
 
     /// Complete the upload (provider-specific finalization)
     async fn complete_upload(&self, session: &UploadSession) -> Result<()> {
-        let policy_type = session.policy_type();
+        let policy_type = session.effective_policy_type();
         debug!(
             target: "uploader",
             session_id = %session.session_id(),

@@ -106,6 +106,7 @@ pub(crate) struct UploadSessionQueryRow {
     pub policy_type: String,
     pub session_data: String,
     pub chunk_progress: String,
+    #[allow(dead_code)]
     pub encrypt_metadata: Option<String>,
      #[allow(dead_code)]
     pub expires_at: i64,
@@ -139,9 +140,8 @@ impl UploadSessionRow {
         let chunk_progress_json = serde_json::to_string(&session.chunk_progress)
             .context("Failed to serialize chunk progress")?;
         let encrypt_metadata_json = session
-            .encrypt_metadata
-            .as_ref()
-            .map(|m| serde_json::to_string(m))
+            .encrypt_metadata()
+            .map(serde_json::to_string)
             .transpose()
             .context("Failed to serialize encrypt metadata")?;
 
@@ -152,12 +152,12 @@ impl UploadSessionRow {
             local_path: session.local_path.clone(),
             remote_uri: session.remote_uri.clone(),
             file_size: session.file_size as i64,
-            chunk_size: session.chunk_size as i64,
-            policy_type: session.policy_type().as_str().to_string(),
+            chunk_size: session.chunk_size() as i64,
+            policy_type: session.effective_policy_type().as_str().to_string(),
             session_data: credential_json,
             chunk_progress: chunk_progress_json,
             encrypt_metadata: encrypt_metadata_json,
-            expires_at: session.expires_at,
+            expires_at: session.expires_at(),
             created_at: session.created_at,
             updated_at: session.updated_at,
         })
@@ -174,11 +174,6 @@ impl TryFrom<UploadSessionQueryRow> for crate::uploader::UploadSession {
         let chunk_progress: Vec<crate::uploader::ChunkProgress> =
             serde_json::from_str(&row.chunk_progress)
                 .context("Failed to deserialize chunk progress")?;
-        let encrypt_metadata = row
-            .encrypt_metadata
-            .map(|s| serde_json::from_str(&s))
-            .transpose()
-            .context("Failed to deserialize encrypt metadata")?;
 
         // Reconstruct the session
         let mut session = crate::uploader::UploadSession::new(
@@ -193,7 +188,6 @@ impl TryFrom<UploadSessionQueryRow> for crate::uploader::UploadSession {
         // Restore persisted state
         session.id = row.id;
         session.chunk_progress = chunk_progress;
-        session.encrypt_metadata = encrypt_metadata;
         session.created_at = row.created_at;
         session.updated_at = row.updated_at;
 

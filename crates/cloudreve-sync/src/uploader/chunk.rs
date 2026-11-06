@@ -306,9 +306,8 @@ impl ChunkUploader {
 
         // Get encryption config if needed
         let encryption = session
-            .encrypt_metadata
-            .as_ref()
-            .map(|meta| EncryptionConfig::from_metadata(meta))
+            .encrypt_metadata()
+            .map(EncryptionConfig::from_metadata)
             .transpose()?;
 
         // Get pending chunks
