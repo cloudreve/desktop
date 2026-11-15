@@ -462,12 +462,6 @@ impl Client {
 
         // Check response code
         if api_response.code != ErrorCode::Success as i32 {
-            // Check if this is a credential error and invoke callback
-            if let Some(error_code) = ErrorCode::from_code(api_response.code) {
-                if error_code.is_credential_error() {
-                    self.notify_credential_invalid().await;
-                }
-            }
             return Err(ApiError::from_response(api_response));
         }
 
@@ -492,10 +486,18 @@ impl Client {
             .await
         {
             Ok(result) => Ok(result),
-            Err(ApiError::AccessTokenExpired) => {
-                // Token expired, refresh and retry
+            Err(e) if !options.no_credential && e.requires_login() => {
                 self.refresh_access_token().await?;
-                self.send_internal(path, method, body, options).await
+                let result = self.send_internal(path, method, body, options).await;
+                if result
+                    .as_ref()
+                    .err()
+                    .map(|err| err.requires_login())
+                    .unwrap_or(false)
+                {
+                    self.notify_credential_invalid().await;
+                }
+                result
             }
             Err(e) => Err(e),
         }
